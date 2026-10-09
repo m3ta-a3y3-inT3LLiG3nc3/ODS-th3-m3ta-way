@@ -25,16 +25,16 @@ service:
   env_vars:
     - key: ODS_PLANE_BASE_URL
       default: ""
-      description: Verified Plane instance base URL. Activation requires an operator-verified URL.
+      description: Verified HTTPS Plane URL; plain HTTP is rejected unless explicitly opted into.
     - key: ODS_PLANE_WORKSPACE_SLUG
       default: ""
       description: Plane workspace slug used by the read-only project probe.
-    - key: ODS_PLANE_API_KEY_FILE
-      default: /run/secrets/plane_api_key
-      description: Mounted secret-file reference for the Plane API key; the key is never stored in environment variables.
-    - key: ODS_PLANE_WEBHOOK_SECRET_FILE
-      default: /run/secrets/plane_webhook_secret
-      description: Optional mounted secret-file reference for HMAC verification; webhook ingestion remains disabled.
+    - key: ODS_PLANE_ALLOW_INSECURE_HTTP
+      default: "false"
+      description: Set true only for a trusted private network where the Plane API is intentionally served over HTTP.
+    - key: ODS_PLANE_API_KEY_HOST_FILE
+      default: ./extensions/services/integration-gateway/config/plane_api_key.empty
+      description: Host path to the Plane API key secret file, mounted read-only into the service.
 
 features:
   - id: governed-integrations

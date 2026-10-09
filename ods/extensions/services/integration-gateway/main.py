@@ -30,12 +30,12 @@ def _read_json(path: Path):
     return json.loads(path.read_text(encoding="utf-8"))
 
 
-def _valid_base_url(base_url: str) -> bool:
+def _valid_base_url(base_url: str, allow_insecure_http: bool = False) -> bool:
     try:
         parsed = urlsplit(base_url)
         port = parsed.port
         return bool(
-            parsed.scheme in {"http", "https"}
+            (parsed.scheme == "https" or (allow_insecure_http and parsed.scheme == "http"))
             and parsed.hostname
             and (port is None or 1 <= port <= 65535)
             and not parsed.username
@@ -47,14 +47,23 @@ def _valid_base_url(base_url: str) -> bool:
         return False
 
 
+def _has_plane_api_key(key_file: Path) -> bool:
+    try:
+        api_key = key_file.read_text(encoding="utf-8").strip()
+    except (OSError, UnicodeError):
+        return False
+    return bool(api_key and "\n" not in api_key and "\r" not in api_key)
+
+
 def _plane_configuration() -> tuple[str, str, Path] | None:
     base_url = os.getenv("ODS_PLANE_BASE_URL", "").strip().rstrip("/")
     workspace_slug = os.getenv("ODS_PLANE_WORKSPACE_SLUG", "").strip()
     key_file = Path(os.getenv("ODS_PLANE_API_KEY_FILE", "/run/secrets/plane_api_key"))
-    if not (base_url and workspace_slug and key_file.is_file()):
+    allow_insecure_http = os.getenv("ODS_PLANE_ALLOW_INSECURE_HTTP", "").lower() == "true"
+    if not (base_url and workspace_slug and _has_plane_api_key(key_file)):
         return None
     if (
-        not _valid_base_url(base_url)
+        not _valid_base_url(base_url, allow_insecure_http)
         or not WORKSPACE_SLUG_RE.fullmatch(workspace_slug)
     ):
         return None
@@ -191,14 +200,17 @@ async def readiness():
     key_file = Path(os.getenv("ODS_PLANE_API_KEY_FILE", "/run/secrets/plane_api_key"))
     if not base_url:
         missing.append("ODS_PLANE_BASE_URL")
-    elif not _valid_base_url(base_url):
-        missing.append("valid ODS_PLANE_BASE_URL")
+    elif not _valid_base_url(
+        base_url,
+        os.getenv("ODS_PLANE_ALLOW_INSECURE_HTTP", "").lower() == "true",
+    ):
+        missing.append("HTTPS ODS_PLANE_BASE_URL (or explicit HTTP opt-in)")
     if not workspace_slug:
         missing.append("ODS_PLANE_WORKSPACE_SLUG")
     elif not WORKSPACE_SLUG_RE.fullmatch(workspace_slug):
         missing.append("valid ODS_PLANE_WORKSPACE_SLUG")
-    if not key_file.is_file():
-        missing.append("ODS_PLANE_API_KEY_FILE")
+    if not _has_plane_api_key(key_file):
+        missing.append("Plane API key secret file")
     configuration = _plane_configuration()
     if configuration is None:
         return {

@@ -55,7 +55,29 @@ def test_readiness_rejects_malformed_plane_url(gateway, monkeypatch, url):
 
     assert response.status_code == 200
     assert response.json()["status"] == "not_configured"
-    assert "valid ODS_PLANE_BASE_URL" in response.json()["missing"]
+    assert any(
+        item.startswith("HTTPS ODS_PLANE_BASE_URL")
+        for item in response.json()["missing"]
+    )
+
+
+def test_plane_http_requires_explicit_insecure_opt_in(gateway, monkeypatch):
+    module, _, _ = gateway
+    monkeypatch.setenv("ODS_PLANE_BASE_URL", "http://plane.example.test")
+
+    assert module._plane_configuration() is None
+    monkeypatch.setenv("ODS_PLANE_ALLOW_INSECURE_HTTP", "true")
+    assert module._plane_configuration() is not None
+
+
+def test_empty_plane_secret_file_does_not_activate_adapter(gateway):
+    module, client, key_file = gateway
+    key_file.write_text("\n", encoding="utf-8")
+
+    assert module._plane_configuration() is None
+    response = client.get("/api/readiness")
+    assert response.json()["status"] == "not_configured"
+    assert "Plane API key secret file" in response.json()["missing"]
 
 
 def test_validate_event_and_reject_invalid_schema(gateway):

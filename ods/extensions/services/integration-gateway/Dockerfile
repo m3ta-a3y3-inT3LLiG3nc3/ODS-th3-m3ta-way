@@ -10,8 +10,7 @@ COPY config/ config/
 COPY schemas/ schemas/
 RUN chmod -R a+rX /app
 
-RUN useradd --system --no-create-home gateway
-USER gateway
+USER 10000:10000
 
 EXPOSE 8092
 CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8092"]

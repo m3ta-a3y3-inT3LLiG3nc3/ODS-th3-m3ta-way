@@ -17,6 +17,7 @@ def gateway(tmp_path, monkeypatch):
     monkeypatch.setenv("ODS_PLANE_BASE_URL", "https://plane.example.test")
     monkeypatch.setenv("ODS_PLANE_WORKSPACE_SLUG", "workspace")
     monkeypatch.setenv("ODS_PLANE_API_KEY_FILE", str(key_file))
+    monkeypatch.delenv("ODS_PLANE_ALLOW_INSECURE_HTTP", raising=False)
     if "main" in sys.modules:
         del sys.modules["main"]
     module = importlib.import_module("main")
