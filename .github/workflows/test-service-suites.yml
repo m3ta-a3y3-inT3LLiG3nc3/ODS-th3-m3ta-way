@@ -8,6 +8,7 @@ on:
   pull_request:
     paths:
       - "ods/extensions/services/ape/**"
+      - "ods/extensions/services/integration-gateway/**"
       - "ods/extensions/services/pixel-model-relay/**"
       - "ods/extensions/services/privacy-shield/**"
       - "ods/extensions/services/token-spy/**"
@@ -16,6 +17,7 @@ on:
     branches: [main]
     paths:
       - "ods/extensions/services/ape/**"
+      - "ods/extensions/services/integration-gateway/**"
       - "ods/extensions/services/pixel-model-relay/**"
       - "ods/extensions/services/privacy-shield/**"
       - "ods/extensions/services/token-spy/**"
@@ -35,6 +37,8 @@ jobs:
         include:
           - service: ape
             python: "3.12"
+          - service: integration-gateway
+            python: "3.11"
           - service: pixel-model-relay
             python: "3.11"
           - service: privacy-shield

@@ -1,0 +1,18 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://ods.ai/schemas/integration-event.v1.json",
+  "title": "ODS Integration Event v1",
+  "type": "object",
+  "required": ["id", "type", "source", "occurred_at", "object", "classification", "payload"],
+  "properties": {
+    "id": {"type": "string", "minLength": 1, "maxLength": 256},
+    "type": {"type": "string", "minLength": 1, "maxLength": 256},
+    "source": {"type": "string", "minLength": 1, "maxLength": 128},
+    "occurred_at": {"type": "string", "format": "date-time"},
+    "object": {"$ref": "https://ods.ai/schemas/object-reference.v1.json"},
+    "classification": {"enum": ["public", "internal", "confidential", "restricted"]},
+    "payload": {"type": "object"},
+    "correlation_id": {"type": "string", "maxLength": 256}
+  },
+  "additionalProperties": false
+}

@@ -1,0 +1,35 @@
+services:
+  integration-gateway:
+    build:
+      context: ./extensions/services/integration-gateway
+      dockerfile: Dockerfile
+    container_name: ods-integration-gateway
+    restart: unless-stopped
+    environment:
+      ODS_PLANE_BASE_URL: ${ODS_PLANE_BASE_URL:-}
+      ODS_PLANE_WORKSPACE_SLUG: ${ODS_PLANE_WORKSPACE_SLUG:-}
+      ODS_PLANE_API_KEY_FILE: ${ODS_PLANE_API_KEY_FILE:-/run/secrets/plane_api_key}
+      ODS_PLANE_WEBHOOK_SECRET_FILE: ${ODS_PLANE_WEBHOOK_SECRET_FILE:-/run/secrets/plane_webhook_secret}
+    expose:
+      - "8092"
+    security_opt:
+      - no-new-privileges:true
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8092/health')"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 256M
+        reservations:
+          cpus: "0.1"
+          memory: 64M
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
