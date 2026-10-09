@@ -1,0 +1,12 @@
+{
+  "version": 1,
+  "classifications": ["public", "internal", "confidential", "restricted"],
+  "default_classification": "internal",
+  "rules": [
+    {"classification": "restricted", "requires_explicit_authorization": true},
+    {"classification": "confidential", "requires_explicit_authorization": true},
+    {"classification": "internal", "requires_explicit_authorization": false},
+    {"classification": "public", "requires_explicit_authorization": false}
+  ],
+  "external_writes_enabled": false
+}

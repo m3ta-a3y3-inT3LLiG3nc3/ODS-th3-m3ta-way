@@ -4,7 +4,7 @@ import unittest
 
 
 ROOT = Path(__file__).resolve().parents[2]
-SERVICES = ('ape', 'dashboard-api', 'model-router', 'pixel-edge',
+SERVICES = ('ape', 'dashboard-api', 'integration-gateway', 'model-router', 'pixel-edge',
             'pixel-inference', 'pixel-model-relay', 'privacy-shield',
             'remote-provider-egress', 'token-spy')
 
