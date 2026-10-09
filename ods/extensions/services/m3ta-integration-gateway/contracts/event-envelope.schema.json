@@ -1,0 +1,32 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://m3ta.local/contracts/event-envelope.schema.json",
+  "title": "M3ta Event Envelope",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["event_id", "event_type", "schema_version", "occurred_at", "origin", "actor", "object", "correlation_id", "payload", "classification"],
+  "properties": {
+    "event_id": {"type": "string", "format": "uuid"},
+    "event_type": {"type": "string", "pattern": "^[a-z][a-z0-9_]*\\.[a-z][a-z0-9_]*$"},
+    "schema_version": {"const": "1.0"},
+    "occurred_at": {"type": "string", "format": "date-time"},
+    "origin": {"type": "string", "minLength": 1},
+    "actor": {"$ref": "#/$defs/actor"},
+    "object": {"$ref": "object-reference.schema.json"},
+    "correlation_id": {"type": "string", "format": "uuid"},
+    "causation_id": {"type": ["string", "null"], "format": "uuid"},
+    "payload": {"type": "object"},
+    "classification": {"enum": ["public", "internal", "confidential", "restricted"]}
+  },
+  "$defs": {
+    "actor": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "id"],
+      "properties": {
+        "type": {"enum": ["human", "agent", "system"]},
+        "id": {"type": "string", "minLength": 1}
+      }
+    }
+  }
+}

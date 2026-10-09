@@ -1,0 +1,17 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://m3ta.local/contracts/sync-result.schema.json",
+  "title": "M3ta Sync Result",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["event_id", "adapter", "status", "attempted_at"],
+  "properties": {
+    "event_id": {"type": "string", "format": "uuid"},
+    "adapter": {"type": "string", "minLength": 1},
+    "status": {"enum": ["accepted", "delivered", "rejected", "quarantined", "failed"]},
+    "attempted_at": {"type": "string", "format": "date-time"},
+    "native_id": {"type": ["string", "null"]},
+    "reason": {"type": ["string", "null"]},
+    "retryable": {"type": "boolean", "default": false}
+  }
+}

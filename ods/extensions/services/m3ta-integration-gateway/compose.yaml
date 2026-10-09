@@ -1,0 +1,41 @@
+services:
+  m3ta-integration-gateway:
+    build:
+      context: ./extensions/services/m3ta-integration-gateway
+      dockerfile: Dockerfile
+    container_name: ods-m3ta-integration-gateway
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    environment:
+      - M3TA_GATEWAY_CONFIG_DIR=/config
+      - M3TA_GATEWAY_DATA_DIR=/data/m3ta-integration-gateway
+      - M3TA_GATEWAY_LOG_LEVEL=${M3TA_GATEWAY_LOG_LEVEL:-INFO}
+      - PLANE_BASE_URL=${PLANE_BASE_URL:-https://api.plane.so}
+      - PLANE_WORKSPACE_SLUG=${PLANE_WORKSPACE_SLUG:-}
+      - PLANE_API_KEY=${PLANE_API_KEY:-}
+      - PLANE_WEBHOOK_SECRET=${PLANE_WEBHOOK_SECRET:-}
+    volumes:
+      - ./extensions/services/m3ta-integration-gateway/config:/config:ro,z
+      - ./data/m3ta-integration-gateway:/data/m3ta-integration-gateway:z
+    ports:
+      - "${BIND_ADDRESS:-127.0.0.1}:${M3TA_INTEGRATION_GATEWAY_PORT:-8094}:8094"
+    deploy:
+      resources:
+        limits:
+          cpus: '0.5'
+          memory: 256M
+        reservations:
+          cpus: '0.1'
+          memory: 64M
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8094/health')"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "3"

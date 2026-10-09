@@ -1,0 +1,14 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://m3ta.local/contracts/object-reference.schema.json",
+  "title": "M3ta Object Reference",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["meta_object_id", "native_id", "type"],
+  "properties": {
+    "meta_object_id": {"type": "string", "format": "uuid"},
+    "native_id": {"type": "string", "minLength": 1},
+    "native_url": {"type": ["string", "null"], "format": "uri"},
+    "type": {"type": "string", "minLength": 1}
+  }
+}

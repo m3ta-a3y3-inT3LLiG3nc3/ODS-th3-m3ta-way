@@ -1,0 +1,56 @@
+schema_version: m3ta.platforms.v1
+platforms:
+  qb:
+    role: intelligence-policy-orchestrator
+    authority: plans-and-routing
+    mode: internal
+    write_enabled: false
+    configuration_required: [QB_GATEWAY_URL]
+  hermes:
+    role: execution-plane
+    authority: tool-execution
+    mode: internal
+    write_enabled: false
+    configuration_required: [HERMES_GATEWAY_URL]
+  plane:
+    role: work-control-plane
+    authority: projects-and-work-items
+    mode: mcp-api-webhook
+    write_enabled: false
+    configuration_required: [PLANE_BASE_URL, PLANE_WORKSPACE_SLUG, PLANE_API_KEY]
+  open_notebook:
+    role: research-intelligence
+    authority: notebooks-sources-research-notes
+    mode: mcp-api
+    write_enabled: false
+    configuration_required: [OPEN_NOTEBOOK_URL, OPEN_NOTEBOOK_SECRET_REF]
+  nimbalyst:
+    role: visual-agent-workbench
+    authority: agent-sessions-and-reviewed-diffs
+    mode: mcp-files
+    write_enabled: false
+    configuration_required: [NIMBALYST_MCP_URL]
+  colanode:
+    role: collaboration-workspace
+    authority: collaboration-pages-and-conversations
+    mode: projection-adapter
+    write_enabled: false
+    configuration_required: [COLANODE_BASE_URL, COLANODE_SECRET_REF]
+  hynote:
+    role: multimodal-capture-inbox
+    authority: original-captures-and-transcripts
+    mode: watched-inbox
+    write_enabled: false
+    configuration_required: [HYNOTE_INBOX_PATH]
+  raycast:
+    role: desktop-command-surface
+    authority: user-intent-and-approvals
+    mode: extension-http
+    write_enabled: false
+    configuration_required: [RAYCAST_CLIENT_ID]
+  brainoutside:
+    role: durable-knowledge
+    authority: approved-canonical-knowledge
+    mode: git-human-approval
+    write_enabled: false
+    configuration_required: [BRAINOUTSIDE_REPOSITORY]

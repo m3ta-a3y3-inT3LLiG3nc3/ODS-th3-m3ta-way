@@ -1,0 +1,26 @@
+schema_version: m3ta.ownership.v1
+object_types:
+  work_item:
+    authority: plane
+    mirrors: [colanode, nimbalyst]
+  research_source:
+    authority: open_notebook
+    mirrors: [brainoutside]
+  collaboration_page:
+    authority: colanode
+    mirrors: []
+  agent_session:
+    authority: nimbalyst
+    mirrors: [plane]
+  capture:
+    authority: hynote
+    mirrors: [open_notebook]
+  user_command:
+    authority: raycast
+    mirrors: []
+  execution_receipt:
+    authority: hermes
+    mirrors: [plane, brainoutside]
+  canonical_knowledge:
+    authority: brainoutside
+    mirrors: [open_notebook]

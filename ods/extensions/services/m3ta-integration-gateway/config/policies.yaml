@@ -1,0 +1,20 @@
+schema_version: m3ta.integration-policy.v1
+defaults:
+  writes_enabled: false
+  destructive_actions: require_human_approval
+  unknown_event_types: reject
+  unknown_origins: reject
+  delivery_semantics: at_least_once
+  duplicate_handling: idempotency_key
+  conflict_handling: quarantine
+  durable_knowledge_promotion: require_human_approval
+  secrets: references_only
+classifications:
+  public:
+    allowed_destinations: [plane, open_notebook, nimbalyst, colanode, hynote, raycast, brainoutside]
+  internal:
+    allowed_destinations: [plane, open_notebook, nimbalyst, colanode, raycast, brainoutside]
+  confidential:
+    allowed_destinations: [plane, open_notebook, colanode, brainoutside]
+  restricted:
+    allowed_destinations: [brainoutside]
