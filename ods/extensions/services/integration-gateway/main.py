@@ -33,9 +33,11 @@ def _read_json(path: Path):
 def _valid_base_url(base_url: str) -> bool:
     try:
         parsed = urlsplit(base_url)
+        port = parsed.port
         return bool(
             parsed.scheme in {"http", "https"}
             and parsed.hostname
+            and (port is None or 1 <= port <= 65535)
             and not parsed.username
             and not parsed.password
             and not parsed.query

@@ -2,6 +2,7 @@ import hashlib
 import hmac
 
 import httpx
+import pytest
 
 
 def test_health_and_platform_inventory(gateway):
@@ -43,9 +44,12 @@ def test_readiness_requires_operator_configuration(gateway, monkeypatch):
     assert response.json()["external_writes_enabled"] is False
 
 
-def test_readiness_rejects_malformed_plane_url(gateway, monkeypatch):
+@pytest.mark.parametrize(
+    "url", ["https://[invalid", "https://plane.example.test:bad"]
+)
+def test_readiness_rejects_malformed_plane_url(gateway, monkeypatch, url):
     _, client, _ = gateway
-    monkeypatch.setenv("ODS_PLANE_BASE_URL", "https://[invalid")
+    monkeypatch.setenv("ODS_PLANE_BASE_URL", url)
 
     response = client.get("/api/readiness")
 
