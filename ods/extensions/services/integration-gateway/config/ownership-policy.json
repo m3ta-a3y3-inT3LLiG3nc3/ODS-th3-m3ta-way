@@ -1,0 +1,12 @@
+{
+  "version": 1,
+  "default_owner": "source_platform",
+  "fields": {
+    "task.title": {"authority": "plane", "write_policy": "disabled"},
+    "task.description": {"authority": "plane", "write_policy": "disabled"},
+    "task.status": {"authority": "plane", "write_policy": "disabled"},
+    "knowledge.content": {"authority": "source_platform", "write_policy": "disabled"},
+    "identity.profile": {"authority": "identity_provider", "write_policy": "disabled"}
+  },
+  "external_writes_enabled": false
+}

@@ -1,0 +1,11 @@
+[
+  {"id": "qb", "name": "QB", "adapter": "catalog_only", "access": "not_configured"},
+  {"id": "hermes", "name": "Hermes", "adapter": "catalog_only", "access": "not_configured"},
+  {"id": "plane", "name": "Plane", "adapter": "read_only", "access": "read"},
+  {"id": "open-notebook", "name": "Open Notebook", "adapter": "catalog_only", "access": "not_configured"},
+  {"id": "nimbalyst", "name": "Nimbalyst", "adapter": "catalog_only", "access": "not_configured"},
+  {"id": "colanode", "name": "Colanode", "adapter": "catalog_only", "access": "not_configured"},
+  {"id": "hynote", "name": "HyNote", "adapter": "catalog_only", "access": "not_configured"},
+  {"id": "raycast", "name": "Raycast", "adapter": "catalog_only", "access": "not_configured"},
+  {"id": "brainoutside", "name": "BrainOutside", "adapter": "catalog_only", "access": "not_configured"}
+]

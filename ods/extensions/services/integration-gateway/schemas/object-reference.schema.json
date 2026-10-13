@@ -1,0 +1,15 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://ods.ai/schemas/object-reference.v1.json",
+  "title": "ODS Integration Object Reference v1",
+  "type": "object",
+  "required": ["platform", "object_type", "external_id"],
+  "properties": {
+    "platform": {"type": "string", "minLength": 1, "maxLength": 128},
+    "object_type": {"type": "string", "minLength": 1, "maxLength": 128},
+    "external_id": {"type": "string", "minLength": 1, "maxLength": 512},
+    "external_url": {"type": "string", "format": "uri"},
+    "title": {"type": "string", "maxLength": 2048}
+  },
+  "additionalProperties": false
+}

@@ -1,0 +1,16 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://ods.ai/schemas/sync-result.v1.json",
+  "title": "ODS Integration Sync Result v1",
+  "type": "object",
+  "required": ["status", "source", "target", "external_writes_enabled"],
+  "properties": {
+    "status": {"enum": ["pending", "synced", "skipped", "failed"]},
+    "source": {"$ref": "https://ods.ai/schemas/object-reference.v1.json"},
+    "target": {"$ref": "https://ods.ai/schemas/object-reference.v1.json"},
+    "external_writes_enabled": {"const": false},
+    "message": {"type": "string", "maxLength": 2048},
+    "completed_at": {"type": "string", "format": "date-time"}
+  },
+  "additionalProperties": false
+}

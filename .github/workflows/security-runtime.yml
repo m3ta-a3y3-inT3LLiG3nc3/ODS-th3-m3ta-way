@@ -22,7 +22,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        service: [ape, dashboard-api, model-router, pixel-edge, pixel-inference, pixel-model-relay, privacy-shield, remote-provider-egress, token-spy]
+        service: [ape, dashboard-api, integration-gateway, model-router, pixel-edge, pixel-inference, pixel-model-relay, privacy-shield, remote-provider-egress, token-spy]
     env:
       SERVICE: ${{ matrix.service }}
     steps:
@@ -71,7 +71,7 @@ jobs:
             --security-opt no-new-privileges --entrypoint python \
             "ods-security-$SERVICE:ci" -m pip check
           case "$SERVICE" in
-            ape) entry=/app/main.py; uid= ;;
+            ape|integration-gateway) entry=/app/main.py; uid= ;;
             dashboard-api) entry=/app/main.py; uid=1000 ;;
             model-router) entry=/srv/model-router/app/main.py; uid=10777 ;;
             pixel-edge) entry=/app/edge_entrypoint.py; uid=1000 ;;
