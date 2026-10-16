@@ -675,12 +675,15 @@ managed agent route supports OpenClaw's 4096-token minimum, including the
 bundled 8K T0 profile. Models below 16K run in a deliberately constrained
 adaptive mode, where task complexity and reliability vary with the available
 prompt budget; they are not excluded. An advanced custom activation below 4K
-is rejected before any model state changes. Below 32K, ODS lowers Pixel's
-output ceiling to one quarter of the context; at 32K and above it allows up to
-4096 output tokens. ODS derives OpenClaw's compaction reserve from that output
-ceiling and enables a half-window reserve floor for 8K-31K adaptive profiles,
-where dense tool transcripts can otherwise outrun OpenClaw's character-based
-estimate. The retained recent tail is capped at one sixteenth of the selected
+is rejected before any model state changes. ODS sets Pixel's output ceiling to
+one quarter of the context, up to 8192 tokens. OpenClaw's compaction reserve is
+one fifth of the context plus four fifths of that output ceiling, with no
+separate reserve floor, because a redundant floor can reject otherwise usable
+compacted history. At 8K this leaves about 4.9K tokens for the prompt and tool
+definitions, which many Portal tasks exceed ("context overflow"). With
+`ODS_MODEL_PROFILES=enabled`, Portal shows a "context too small" advisory for a
+local model served below 16K, with the fix: load it with more context, or switch
+models. The retained recent tail is capped at one sixteenth of the selected
 context (and 20K tokens globally), so compaction always removes real history
 instead of recording a no-op when the runtime's fixed 20K default exceeds the
 whole model window.

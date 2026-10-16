@@ -1,4 +1,4 @@
-import {validDeliveredArtifact} from './workspace-artifact.mjs';
+import {validDeliveredArtifact, normalizeWorkspaceArtifact, WORKSPACE_ARTIFACT_DELIVERY_GUIDANCE} from './workspace-artifact.mjs';
 // Pixel per-run tool-loop guard.
 //
 // OpenClaw's built-in identical-call detector blocks a repeated tool call, but
@@ -29,7 +29,7 @@ import { researchRequestProblem } from "./perplexica-research.mjs";
 import { HOST_CITATION_LIMITS } from './citation-verification.mjs';
 import { createExtensionCompletionGate } from "./extension-completion-gate.mjs";
 import { parseQuestions, questionsText, requestsChoiceQuestion, choiceQuestionFromText } from "./ask-user.mjs";
-import { createRunProgressBudget, failedToolOutcome, isLiteralEcho, progressLaneStopReason, RUN_PROGRESS_STOP_REASON } from "./run-progress-budget.mjs";
+import { createRunProgressBudget, failedToolOutcome, isLiteralEcho, lookupFoundNothing, progressLaneStopReason, RUN_PROGRESS_STOP_REASON } from "./run-progress-budget.mjs";
 import { assistantMessageText, composeProgressFinalization, composeReadPages, createProgressFinalization, partialFinalizationAnswer,
   PROGRESS_FINALIZATION_INSTRUCTION } from "./progress-finalization.mjs";
 import { STOP_SYNTHESIS_LIMITS, STOP_SYNTHESIS_NOTE, synthesisAnswer, synthesisRequest } from "./stop-synthesis.mjs";
@@ -204,9 +204,21 @@ export const PENDING_EXEC_LOOP_ABORT_REASON =
 export const PHANTOM_PROCESS_REASON =
   "No background process is running in this response. Every command so far has completed, and its output is in the corresponding exec result. Continue with that output instead of calling process.";
 
+const NATIVE_DELEGATION_WAIT_REASON =
+  'This owner response has accepted native subagents with completion events still pending. The process tool controls background exec sessions; it cannot wait for native subagents. Call tool_describe with {"id":"openclaw:core:sessions_yield"}, then tool_call with {"id":"openclaw:core:sessions_yield","args":{}} to end this turn and receive their completion events. This is a native tool call, not process(action="yield") or a shell command. This refused process call ran nothing.';
+
 // Per run and per kind of corrective answer (see recordFreeCorrection): how
 // many answers are recorded without consuming the failure budget.
 export const FREE_CORRECTIONS_PER_KIND = 2;
+
+// Per run: how many bound exec lookups that completed and found nothing (see
+// lookupFoundNothing) are recorded as discovery instead of failures. A coding
+// session searches for a name, sees "not here" and searches elsewhere; on the
+// RTX Spark (Elf of Doom, 2026-10-16) such empty greps, counted as failures,
+// filled the 12-failure total and stopped a run that had made 21 good edits.
+// Discovery never resets the round fuse, so a run of searches that changes
+// nothing still stops after RUN_PROGRESS_LIMITS.roundsWithoutProgress rounds.
+export const FREE_EMPTY_LOOKUPS_PER_RUN = 12;
 
 // Refusals for a write that re-types existing workspace files (see
 // derivedWriteMatch). Fixed text; only the appended matched paths vary.
@@ -271,7 +283,7 @@ const WORKSPACE_PREVIEW_FAILURE_REASONS = Object.freeze({
   snapshot_too_large: "the directory exceeds the preview size limit",
   unsafe_file: "a file failed the preview safety checks",
   writable_file: "a generated file allows group/other writes; remove only those write bits on affected output files, never broaden permissions or change parent directories",
-  unsafe_directory: "the directory failed the preview path or permission checks",
+  unsafe_directory: "the directory, a folder on its path, or a folder in it is a symlink, is unreadable, is not owned by the workspace owner, or is writable by group or others, or a folder in it has a name the preview refuses (for example, one with spaces)",
   cancelled: "waiting for the preview was cancelled; publication may still be pending",
   unavailable: "the preview was unavailable; the tool supplied no more specific verified cause",
 });
@@ -4610,9 +4622,12 @@ export function userMessageRequestsWorkspaceDocumentDelivery(messages, prompt = 
   const positive = lane.split(/[!?;\n]+|\.(?=\s|$)/).filter(clause =>
     !/\b(?:do\s+not|don['’]t|never|must\s+not|should\s+not|without)\s+(?:download|deliver|attach|publish)\b/i.test(clause)
   ).join(' ');
-  return /\b(?:download(?:able)?|attach(?:ment)?|deliver(?:y)?)\b/i.test(positive) &&
+  // The noun delivery (for example, a file's delivery date) is not itself
+  // a publication request. Preserve the existing download/attachment phrases
+  // and deliver verb without combining a schedule with a file mention.
+  return /\b(?:download(?:able)?|attach(?:ment)?|deliver)\b/i.test(positive) &&
     (/\.(?:md|markdown|txt|csv|tsv|json|pdf|zip|rar|docx|xlsx|pptx)\b/i.test(positive) ||
-      (/\b(?:documents?|files?|archives?)\b/i.test(positive) &&
+      (/\b(?:documents?|files?|archives?|projects?|source\s+(?:code|filenames?))\b/i.test(positive) &&
         !/\b(?:images?|photos?|audio|video|websites?|webpages?|html)\b|\.(?:png|jpe?g|gif|svg|mp3|mp4|wav|webm|html?)\b/i.test(positive)));
 }
 
@@ -5948,10 +5963,17 @@ function hasExplicitWorkspacePreviewDirective(text) {
   // A requested delivery action can follow a diagnosis or code repair. Do not
   // mistake a subordinate "why we should publish" for that owner command.
   const commands = text.matchAll(
-    /(?:^|[.!?;\n]|\b(?:and(?:\s+then)?|then|now)\s+)\s*(?:please\s+)?(?:(?:can|could|would)\s+you\s+)?(?:try\s+to\s+)?(display|preview|publish|republish|serve|open|show|view)\s+([^!?;\n]{1,512})/gi
+    /(?:^|[.!?;\n]|\b(?:and(?:\s+then)?|then|now|instead)\s+)\s*(?:please\s+)?(?:(?:can|could|would|will)\s+you\s+(?:please\s+)?|I\s+(?:want|need)\s+you\s+to\s+)?(?:try\s+to\s+)?(display|preview|publish|republish|serve|open|show|view)\b/gi
   );
   return [...commands].some((match) => {
-    const target = match[2].split(/\.(?=\s|$)|\b(?:and|then|but|however|instead)\b/i)[0];
+    // Do not consume this target in matchAll: it may contain a later command
+    // such as "Open README.md, then publish demo/index.html".
+    const target = text.slice(match.index + match[0].length, match.index + match[0].length + 512)
+      .split(/[!?;\n]|\.(?=\s|$)|\b(?:and|then|but|however|instead)\b/i)[0].trim();
+    // An explicit publication command can refer to a previously named HTML
+    // file's folder. Questions about what that file shows are not commands.
+    if (/^(?:publish|republish|preview|serve)$/i.test(match[1]) &&
+      /\b(?:folder|directory)\b/i.test(target) && hasWorkspaceHtmlTarget(text)) return true;
     if (hasWorkspaceHtmlTarget(target)) return true;
     const visualTargetPattern = /\b(?:website|site|web\s*page|frontend|dashboard|preview|animation|illustration|scene|game|chart|diagram|svg)\b/i;
     const visualTarget = visualTargetPattern.test(target);
@@ -5964,6 +5986,9 @@ function hasExplicitWorkspacePreviewDirective(text) {
     // command. Bind that pronoun within this clause, not an earlier topic.
     const precedingClause = text.slice(0, match.index)
       .split(/[!?;\n]|\.(?=\s|$)/).at(-1);
+    if (!target.trim() && /^(?:publish|republish|preview|serve)$/i.test(match[1])) {
+      return hasWorkspaceHtmlTarget(precedingClause);
+    }
     return /^(?:it|this|that)(?:\s|[.!?;]|$)/i.test(target.trim()) &&
       (hasWorkspaceHtmlTarget(precedingClause) ||
         (/\b(?:browser|preview)\b/i.test(target) &&
@@ -6206,12 +6231,8 @@ export function userMessageRequestsWorkspacePreview(messages, prompt = undefined
   ) return false;
   const directPreview =
     explicitDelivery ||
-    // A dot inside index.html is part of the requested filename, not a
-    // sentence boundary between the preview action and its target.
-    // Delivery verbs in a rejected list ("do not edit, publish, or run")
-    // are constraints, even when another clause names an HTML file.
-    (hasWorkspaceHtmlTarget(actionText) &&
-      /\b(?:preview|publish|serve|open|show|view)\b/i.test(actionText)) ||
+    // An HTML filename plus "what does it show?" is a read-only question.
+    // Bind delivery to an owner command above, not any nearby verb.
     /\b(?:preview|publish|republish|serve)\b[^.!?;\n]{0,96}\b(?:artworks?|illustrations?|charts?|diagrams?|animations?|games?|sites?|websites?|web\s*pages?|frontends?)\b/i.test(actionText) ||
     /\b(?:site|website|web\s*page|frontend)\b[^.!?;\n]{0,96}\b(?:preview|publish|republish|serve)\b/i.test(actionText);
   const unreachableLocalPreview =
@@ -6389,12 +6410,32 @@ function freshWorkspaceCreationRequested(text) {
   );
 }
 
+function workspaceVisualRepairIntent(text) {
+  const owner = ownerLaneText(text);
+  // Read-only explanations and quoted instructions cannot require an edit.
+  if (/\b(?:do\s+not|don['’]t|never|must\s+not|should\s+not)\s+(?:edit|modify|change|write|overwrite)\s+(?:any\s+)?(?:files?|anything|source)\b|\bno\s+(?:file|source)\s+changes\b/i.test(owner)) return undefined;
+  const commands = owner.matchAll(
+    /(?:^|[.!?;\n]|\b(?:and(?:\s+then)?|then)\s+)\s*(?:please\s+)?(?:(?:can|could|would|will)\s+you\s+(?:please\s+)?)?(?:fix|repair|correct)\s+(?:only\s+)?([^!?;\n]{1,512})/gi
+  );
+  const paths = new Set();
+  let visual = false;
+  for (const command of commands) {
+    const target = command[1];
+    const file = /^(?:the\s+)?[`"']?(?:\/workspace\/)?([A-Za-z0-9_-][A-Za-z0-9._/-]{0,511}\.html?)[`"']?(?=$|[\s:,.!?;])/i.exec(target);
+    if (file && file[1].split('/').every(part => WORKSPACE_PATH_COMPONENT.test(part))) paths.add(file[1]);
+    if (/^(?:(?:the|this|that|existing|previous|current)\s+)+(?:corrected\s+|repaired\s+|fixed\s+)?(?:app|page|preview|site|website)\b/i.test(target)) visual = true;
+  }
+  if (paths.size > 1) return undefined;
+  return paths.size === 1 ? {path:[...paths][0]} : visual ? {} : undefined;
+}
+
 export function userMessageRequestsWorkspaceVisualContinuation(
   messages,
   prompt = undefined
 ) {
   const text = currentOwnerIntentText(messages, prompt);
   if (!text) return false;
+  if (workspaceVisualRepairIntent(text) && !freshWorkspaceCreationRequested(text)) return true;
   if (userMessageRequestsWorkspaceContinuation([], text)) return false;
   // Keeping an app as-is is preservation, not a request to edit a prior preview.
   // Other change verbs in the same request still identify a visual revision.
@@ -7160,13 +7201,33 @@ export function createToolLoopGuard({
   // unchanged consecutive/total failure fuses. A nested Tool Search execution
   // is charged through its outer tool_call receipt, whose ID differs, so it
   // never receives the allowance. Returns whether this answer was free.
-  function recordFreeCorrection(state, kind, callId, toolName) {
+  function recordFreeCorrection(state, kind, callId, toolName, limit = FREE_CORRECTIONS_PER_KIND) {
     if (!state || typeof callId !== "string" || !callId || callId.startsWith("tool_search_code:")) return false;
     const used = state.freeCorrections.get(kind) ?? 0;
-    if (used >= FREE_CORRECTIONS_PER_KIND) return false;
+    if (used >= limit) return false;
     state.freeCorrections.set(kind, used + 1);
     state.progressBudget.observeResult({callId, tool: toolName, failed: false, discovery: true});
     return true;
+  }
+
+  // The exec receipt (direct, or the core exec inside a Tool Search call) for
+  // this exact pending call: same run, transport, session and executed
+  // (wrapped) parameters as recorded before it ran. Undefined for anything
+  // else, so an unbound or foreign receipt is never reclassified.
+  function boundExecReceipt(state, pendingToolRun, event, context, runId, toolCallId, toolName) {
+    const execution = toolName === 'exec' ? event
+      : toolName === 'tool_call' ? toolSearchEventEnvelope(event, 'exec', 'core') : undefined;
+    if (!state || !execution || pendingToolRun?.runId !== runId || pendingToolRun.selectedToolName !== 'exec' ||
+        pendingToolRun.transport !== toolName ||
+        pendingToolRun.inspectionSessionId !== state.currentSessionId ||
+        pendingToolRun.inspectionSessionKey !== state.currentSessionKey ||
+        (context?.sessionId && context.sessionId !== state.currentSessionId) ||
+        (context?.sessionKey && context.sessionKey !== state.currentSessionKey) ||
+        (event?.runId && event.runId !== runId) ||
+        (event?.toolCallId && event.toolCallId !== toolCallId) ||
+        (event?.toolName && event.toolName !== toolName) ||
+        !isDeepStrictEqual(execution.params, pendingToolRun.executedParams)) return undefined;
+    return execution;
   }
 
   // Refusal text for a write that re-types files this run wrote, edited or
@@ -7666,8 +7727,13 @@ export function createToolLoopGuard({
   // Publication currency across later calls (see preview-revalidation.mjs).
   // A call this guard refuses runs nothing: it neither advances nor revokes a
   // pending host comparison, and its receipt is recognized by exact call ID.
-  function beforeToolCall(event, context, agentId = "pixel") {
-    const decision = decideToolCall(event, context, agentId);
+  function beforeToolCall(event, context, agentId = "pixel", nativeDelegationPending = false) {
+    const originalDecision = decideToolCall(event, context, agentId);
+    // Only refine an already-proven phantom process refusal. Real exec
+    // sessions, earlier denials, correction allowances and failure fuses keep
+    // their existing decisions. Fixed text preserves identical-outcome checks.
+    const decision = nativeDelegationPending === true && originalDecision?.blockReason === PHANTOM_PROCESS_REASON
+      ? {...originalDecision,blockReason:NATIVE_DELEGATION_WAIT_REASON} : originalDecision;
     const toolName = context?.toolName ?? event?.toolName;
     const { runId } = runIdentity(event, context);
     const state = context?.agentId === agentId && runId ? runs.get(runId) : undefined;
@@ -9785,13 +9851,19 @@ export function createToolLoopGuard({
         const verificationContinuationRequested = userMessageRequestsWorkspaceVerificationContinuation(
           event?.messages, event?.prompt
         );
+        const repairPath = workspaceVisualRepairIntent(ownerIntent)?.path;
+        // A named repair inherits only the verified project it actually names.
+        // Unrelated files remain on the ordinary workspace path, not redirected
+        // into the last preview merely because this session has one.
+        const repairMatchesPreview = !repairPath ||
+          repairPath.startsWith(`${previousPreview?.relativeDirectory}/`);
         // Verification intent survives a gateway restart; it requires fresh
         // evidence but cannot confer a previous project's continuation scope.
         // A host-authored delivery retry in this same run must not erase the
         // original owner's verification obligation.
         state.workspacePreviewVerificationRequested ||= verificationContinuationRequested;
         const trustedSessionPreview =
-          (visualContinuationRequested || verificationContinuationRequested) && typeof sessionId === "string" && sessionId
+          (visualContinuationRequested || verificationContinuationRequested) && repairMatchesPreview && typeof sessionId === "string" && sessionId
             ? sessionPreviews.get(sessionId)
             : undefined;
         const previewRequested = namedPreviewRequested || userMessageRequestsWorkspacePreview(
@@ -10320,7 +10392,15 @@ export function createToolLoopGuard({
         state.pendingExecSessions.has(selected.params.sessionId);
       const effectiveProgressTool = toolName === 'tool_call'
         ? String(event.params?.id ?? '').split(':').at(-1) : toolName;
-      state.progressBudget.observeResult({callId: toolCallId, tool: toolName,
+      // A bound lookup that completed and found nothing is an answer: recorded
+      // as discovery (no charge, no reset) within FREE_EMPTY_LOOKUPS_PER_RUN.
+      // The model's own command is read from this call's pending record, since
+      // event.params carries the cancellable wrapper.
+      const lookupReceipt = boundExecReceipt(state, pendingToolRun, event, context, runId, toolCallId, toolName);
+      const emptyLookup = Boolean(lookupReceipt) &&
+        lookupFoundNothing(pendingToolRun.selectedParams?.command, lookupReceipt.result) &&
+        recordFreeCorrection(state, 'empty-lookup', toolCallId, toolName, FREE_EMPTY_LOOKUPS_PER_RUN);
+      if (!emptyLookup) state.progressBudget.observeResult({callId: toolCallId, tool: toolName,
         params: event.params, failed: failedToolOutcome(event), pending: running,
         discovery:state.workspaceLaneRequested && (EXTENSION_METADATA_TOOLS.has(effectiveProgressTool) ||
           effectiveProgressTool === 'pixel_ops_inventory'),
@@ -10593,6 +10673,24 @@ export function createToolLoopGuard({
         }
       }
       state.successfulWritePaths.add(completedWritePath);
+      // A plain document may need no exec step. Keep its successful write
+      // bound to this pending call so publication guidance reaches the next
+      // model pass, before finalization refuses revision after side effects.
+      if (state.workspaceDocumentDeliveryRequested &&
+          pendingToolRun?.runId === runId && pendingToolRun.selectedToolName === 'write' &&
+          pendingToolRun.transport === toolName &&
+          pendingToolRun.inspectionSessionId === state.currentSessionId &&
+          pendingToolRun.inspectionSessionKey === state.currentSessionKey &&
+          (!context?.sessionId || context.sessionId === state.currentSessionId) &&
+          (!context?.sessionKey || context.sessionKey === state.currentSessionKey) &&
+          (!event?.runId || event.runId === runId) &&
+          (!event?.toolCallId || event.toolCallId === toolCallId) &&
+          !['failed','error','blocked','running','pending','unavailable'].includes(successfulMutation.event.result?.details?.status) &&
+          isDeepStrictEqual(successfulMutation.event.params, pendingToolRun.selectedParams)) {
+        try {
+          pendingToolRun.artifactWritePath = normalizeWorkspaceArtifact({relativePath:completedWritePath}).relativePath;
+        } catch { /* Unsupported files still require normal packaging and validation. */ }
+      }
       const writtenContent = successfulMutation.event?.params?.content;
       if (
         typeof writtenContent === "string" &&
@@ -10725,9 +10823,10 @@ export function createToolLoopGuard({
       state.workspacePreviewForbidden && previewEvent?.result?.isError === true;
     // A rejected website tool cannot create a website-delivery obligation for
     // a document-only request. Unexpected successes still follow receipt checks.
+    // Hook vetoes can arrive as event.error without a tool result.
     const documentPreviewError = state.ownerIntentObserved &&
       state.workspaceDocumentDeliveryRequested && !state.workspacePreviewRequired &&
-      previewEvent?.result?.isError === true;
+      toolCallFailed(previewEvent);
     if (previewEvent && !declinedPreviewError && !documentPreviewError) {
       state.workspacePreviewAttempted = true;
       const requestedDirectory = normalizeWorkspaceFilePath(
@@ -11659,9 +11758,9 @@ export function createToolLoopGuard({
       state.progressBudget.observeResult({callId: toolCallId, tool: message.toolName,
         failed: true, lane:progressLane});
     }
-    // Transcript copy only: OpenClaw applies tool_result_persist to the saved
-    // session, not to the live context of this run. The finalization
-    // instruction therefore travels as a before_tool_call refusal.
+    // The ODS-repaired Pixel runtime projects persisted feedback into the next
+    // provider request (openclaw-compaction-budget.json). Other SDK agents keep
+    // storage-only semantics. before_tool_call still enforces the stop itself.
     if (state?.progressBudget.exhausted) {
       return {message: {...message, content: [{type: 'text', text: RUN_PROGRESS_STOP_REASON}]}};
     }
@@ -11775,6 +11874,46 @@ export function createToolLoopGuard({
     const failedToolResult = message.isError === true || Boolean(compactNativeVerification) ||
       compactCoreResult?.details?.result?.isError === true ||
       validatedToolSearchEnvelope(message.details, WORKSPACE_PREVIEW_TOOL, "pixel-ods")?.result?.isError === true;
+    // A successful archive command (or test run) only creates workspace bytes.
+    // Coach the actual publication on an exactly bound terminal exec receipt,
+    // including native exec; deferred-core compaction alone misses that route.
+    const artifactDeliveryPending = state?.workspaceDocumentDeliveryRequested &&
+      !state.workspaceArtifacts?.length && workspaceArtifactUnavailableReason({
+        agentId, runId, sessionId: state.currentSessionId, sessionKey: state.currentSessionKey,
+      }) === undefined;
+    const artifactWritePath = pending?.artifactWritePath;
+    const artifactWriteReceipt = pending?.transport === 'write' ? message
+      : pending?.transport === 'tool_call' ? validatedToolSearchEnvelope(message.details, 'write', 'core')?.result : undefined;
+    // A plain file request need not select the project-work lane. Preserve an
+    // explicit test obligation even when that lane's verification flag is off.
+    const artifactTestsRequested = state?.workspaceVerificationRequested ||
+      /\b(?:(?:run|execute)\s+(?:the\s+)?(?:unit\s*)?tests?|test\s+suite|unittest)\b/i.test(state?.ownerRequestText ?? '');
+    const artifactWriteReady = artifactWritePath && artifactWriteReceipt &&
+      !toolCallFailed({result:artifactWriteReceipt}) && boundWebCall &&
+      message.role === 'toolResult' && message.toolName === pending.transport &&
+      pending.inspectionSessionId === state?.currentSessionId &&
+      pending.inspectionSessionKey === state?.currentSessionKey &&
+      (!context?.sessionKey || context.sessionKey === state.currentSessionKey) &&
+      (!context?.toolName || context.toolName === pending.transport) &&
+      (!event?.toolName || event.toolName === pending.transport) &&
+      (!context?.runId || context.runId === pending.runId) &&
+      (!event?.runId || event.runId === pending.runId) &&
+      !state.ownerQuestionIntent && !state.workspacePreviewRequired &&
+      !state.operationsRequired && !state.exactDownloadRequested &&
+      !state.progressBudget.laneExhausted('workspace') &&
+      (!artifactTestsRequested || state.latestVerificationStatus === 'passed') &&
+      !['failed','pending'].includes(state.latestVerificationStatus) &&
+      state.workspaceRequestedFiles.includes(artifactWritePath.split('/').at(-1)) &&
+      (!state.workspaceTaskPath || (state.workspaceTaskDirectory
+        ? artifactWritePath.startsWith(state.workspaceTaskDirectory + '/') : artifactWritePath === state.workspaceTaskPath)) &&
+      state.workspaceRequestedFiles.every(file => state.successfulWritePaths.has(
+        artifactWritePath.slice(0, artifactWritePath.lastIndexOf('/') + 1) + file));
+    const artifactStageInstruction = artifactDeliveryPending && !failedToolResult &&
+      state.latestVerificationStatus !== 'failed' &&
+      ((executionGuidance && syntaxReceipt?.details?.exitCode === 0) || artifactWriteReady)
+      ? `[ODS Pixel next step] ${WORKSPACE_ARTIFACT_DELIVERY_GUIDANCE}` +
+        (artifactWriteReady ? ` The successfully written file has exact publication args ${JSON.stringify({relativePath:artifactWritePath})}; finish any remaining requested edits and checks first.` : '')
+      : undefined;
     const workspaceStageInstruction = (() => {
       if (failedToolResult) return undefined;
       if (!compactCoreResult || !state || state.progressBudget.laneExhausted('workspace')) return undefined;
@@ -11807,6 +11946,7 @@ export function createToolLoopGuard({
         return `[ODS Pixel next step] ${FAILED_TEST_READ_REPAIR_REASON}`;
       }
       if (state.latestVerificationStatus === "passed") {
+        if (artifactDeliveryPending) return undefined;
         return (
           "[ODS Pixel next step] Verification passed. Give the owner the concise final " +
           "result now; do not call another tool."
@@ -11976,6 +12116,7 @@ export function createToolLoopGuard({
       !compactWebResult &&
       !compactNativeWebResult &&
       !nativeFetchGuidance &&
+      !artifactStageInstruction &&
       !previewStageInstruction &&
       !controlNameRepair &&
       !sandboxPathCorrection &&
@@ -12024,6 +12165,9 @@ export function createToolLoopGuard({
       content.push({type:'text',text:redirectOrderNote});
     if (workspaceStageInstruction && coachingDue('workspace', workspaceStageInstruction)) {
       content.push({ type: "text", text: workspaceStageInstruction });
+    }
+    if (artifactStageInstruction && coachingDue('artifact', artifactStageInstruction)) {
+      content.push({ type: 'text', text: artifactStageInstruction });
     }
     if (sandboxPathCorrection) content.push({type:'text',text:sandboxPathCorrection});
     if (researchBudgetGuidance) content.push({type:'text',text:researchBudgetGuidance});
@@ -12852,9 +12996,19 @@ export function createToolLoopGuard({
     return !reason || reason === 'publication-attempt-limit' ? runs.get(scope.runId) : undefined;
   }
   function deliveryVerificationForRun(runId) {
-    const result=baseDeliveryVerificationForRun(runId);
+    let result=baseDeliveryVerificationForRun(runId);
     const state=runs.get(runId);
     const artifacts=state?.workspaceArtifacts;
+    // Passing tests or creating an archive cannot stand in for its download
+    // receipt. Keep pending questions, cancellation and existing failure facts.
+    if (state?.workspaceDocumentDeliveryRequested && state.artifactOwnerInteractive &&
+        !state.managedTeamWorker && !state.clientCancelled && !artifacts?.length &&
+        ['none','passed','failed'].includes(result.status)) {
+      const missing = 'The requested download was not attached: ODS did not receive a verified artifact publication receipt. A workspace file or passing tests alone does not provide a download.';
+      result = {...result, status: 'failed', text: result.text
+        ? `${missing}\n\n${result.text}`.slice(0, MAX_INGRESS_VERIFICATION_TEXT) : missing};
+      delete result.deliveryMode;
+    }
     return artifacts?.length && !state.clientCancelled && ['none','passed','failed'].includes(result.status)
       ? {...result,artifacts:structuredClone(artifacts)} : result;
   }

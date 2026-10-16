@@ -692,6 +692,16 @@ function Assert-ODSNativeLlamaPlan($Plan) {
         ($Plan.Port -isnot [int] -and $Plan.Port -isnot [long]) -or $Plan.Port -lt 1 -or $Plan.Port -gt 65535) {
         throw 'The saved llama-server plan is invalid (llama.cpp on Windows needs an ASCII .gguf file name).'
     }
+    # A vision model's projector (mmproj) is optional and sits beside its
+    # weights in the same store, under the same ASCII basename rule.
+    if ($null -ne $Plan.MmprojFile) {
+        $projector = [string]$Plan.MmprojFile
+        if ($projector -cnotmatch '^[\x20-\x7e]{1,240}$' -or $projector -notmatch '\.gguf$' -or
+            $projector -match '[\\/:*?"<>|]' -or $projector.StartsWith('.') -or $projector -ne $projector.Trim() -or
+            $projector -ieq [string]$Plan.GgufFile) {
+            throw 'The saved llama-server plan names an invalid vision projector (an ASCII .gguf file beside the model).'
+        }
+    }
 }
 
 function Assert-ODSNativeLlamaOptions($Options) {
@@ -754,6 +764,9 @@ function New-ODSNativeLlamaLaunchArguments($Plan, $Options) {
         '--api-key-file', (ConvertTo-ODSNativeLlamaArgumentPath $Options.ApiKeyPath),
         '--log-file', (ConvertTo-ODSNativeLlamaArgumentPath $Options.LogPath)
     )
+    if ($null -ne $Plan.MmprojFile) {
+        $arguments += @('--mmproj', (ConvertTo-ODSNativeLlamaArgumentPath (Join-Path $Plan.ModelsDir $Plan.MmprojFile)))
+    }
     $arguments += @($Options.ReasoningArguments | ForEach-Object { [string]$_ })
     $arguments += @($Options.ExtraArguments | ForEach-Object { [string]$_ })
     return $arguments
@@ -820,7 +833,7 @@ function Get-ODSNativeLlamaModelProof {
         controller contract ContextLength is the requested size when
         0 <= n_ctx - requested < 256 (llama.cpp alignment), otherwise n_ctx.
     #>
-    param([int]$Port, [string]$GgufFile, [string[]]$ModelPaths, [long]$ContextSize, [string]$ApiKey)
+    param([int]$Port, [string]$GgufFile, [string[]]$ModelPaths, [long]$ContextSize, [string]$ApiKey, [switch]$Vision)
     $models = Invoke-ODSNativeLlamaHttp -Port $Port -Path '/v1/models'
     if ($models.StatusCode -ne 200) { throw "llama-server /v1/models answered HTTP $($models.StatusCode)." }
     $catalog = $models.Body | ConvertFrom-Json -ErrorAction Stop
@@ -839,6 +852,9 @@ function Get-ODSNativeLlamaModelProof {
     $pathMatches = @($ModelPaths | Where-Object { $_ -and $servedPath.Equals([string]$_, [StringComparison]::OrdinalIgnoreCase) })
     if (-not $pathMatches.Count) { throw "llama-server loaded '$servedPath', not the planned model file." }
     if ($settings.total_slots -ne 1) { throw 'llama-server must run exactly one slot for the context proof.' }
+    if ($Vision -and -not ($settings.modalities -and $settings.modalities.vision -eq $true)) {
+        throw 'llama-server did not load the planned vision projector.'
+    }
     $runtimeContext = $settings.default_generation_settings.n_ctx
     if ($runtimeContext -isnot [int] -and $runtimeContext -isnot [long]) { throw 'llama-server /props reported no integer n_ctx.' }
     $difference = [long]$runtimeContext - $ContextSize
@@ -1026,7 +1042,8 @@ function Invoke-ODSNativeLlamaRuntime($Plan, $Options, [string]$ReadyPath) {
         Wait-ODSNativeLlamaStartup -Port $Plan.Port -Process $child
         Assert-ODSNativeLlamaListener $Plan.Port $child.Id $Plan.ExecutablePath
         $proof = Get-ODSNativeLlamaModelProof -Port $Plan.Port -GgufFile $Plan.GgufFile `
-            -ModelPaths @($modelArgument, (Join-Path $Plan.ModelsDir $Plan.GgufFile)) -ContextSize $Plan.ContextSize -ApiKey $apiKey
+            -ModelPaths @($modelArgument, (Join-Path $Plan.ModelsDir $Plan.GgufFile)) -ContextSize $Plan.ContextSize -ApiKey $apiKey `
+            -Vision:($null -ne $Plan.MmprojFile)
         if (-not $proof.ContextVerified) { throw $proof.Message }
         Assert-ODSNativeLlamaListener $Plan.Port $child.Id $Plan.ExecutablePath
         $ready = [ordered]@{ ProcessId = $child.Id; StartedAt = $child.StartTime.ToUniversalTime().ToString('o')

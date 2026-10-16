@@ -23,7 +23,7 @@ import './extensions-refined.css'
 export { getTemplateStatus }
 
 // API/backend services with no user-facing web UI — show badge instead of port link.
-const HEADLESS_EXTENSIONS = new Set(['embeddings', 'tts', 'whisper', 'privacy-shield'])
+const HEADLESS_EXTENSIONS = new Set(['embeddings', 'tts', 'whisper', 'privacy-shield', 'litellm'])
 const UPDATE_CONFIRMATION_STATES = {
   update_state_unknown: 'unknown',
   locally_modified: 'modified',
@@ -128,6 +128,8 @@ export default function Extensions({ compact = false }) {
   const [pollingLost, setPollingLost] = useState(false)
   const installProgressRef = useRef(null)
   const activePollers = useRef({})
+  const catalogRequest = useRef(0)
+  const catalogPending = useRef(false)
   // Per-service recovery tracker: counts consecutive fetch failures and
   // fires onThresholdReached/onRecovered to drive the polling-lost banner.
   // Keyed by serviceId because multiple installs can be polling concurrently.
@@ -178,10 +180,8 @@ export default function Extensions({ compact = false }) {
           // Refresh catalog — if it shows "enabled" (long-running service)
           // or "cli_installed" (one-shot CLI tool whose container exits
           // after init), we're done.
-          const catRes = await fetchJson('/api/extensions/catalog')
-          if (!catRes.ok) return
-          const catData = await catRes.json()
-          setCatalog(catData)
+          const catData = await fetchCatalog({ background: true })
+          if (!catData) return
           const ext = catData.extensions?.find(e => e.id === serviceId)
           if (ext && (ext.status === 'enabled' || ext.status === 'cli_installed')) {
             clearInterval(activePollers.current[serviceId])
@@ -214,6 +214,7 @@ export default function Extensions({ compact = false }) {
       .then(d => setTemplates(d.templates || []))
       .catch(() => {})
     return () => {
+      catalogRequest.current += 1
       Object.values(activePollers.current).forEach(clearInterval)
       activePollers.current = {}
       recoveryTrackers.current = {}
@@ -287,20 +288,41 @@ export default function Extensions({ compact = false }) {
 
   const openDialog = dialog => setConfirm({ ...dialog, id: ++dialogSeq.current })
 
-  const fetchCatalog = async () => {
+  const fetchCatalog = async ({ background = false } = {}) => {
+    // A slow read must get time to finish instead of being superseded on every
+    // progress tick. Explicit refreshes and action completions still take priority.
+    if (background && catalogPending.current) return null
+    // Polls, manual refreshes and action completions share one ordering rule:
+    // only the newest request may publish catalog state or finish its loading UI.
+    const request = ++catalogRequest.current
+    catalogPending.current = true
     try {
-      if (!catalog) setLoading(true)
-      setRefreshing(true)
-      setError(null)
+      if (!background) {
+        if (!catalog) setLoading(true)
+        setRefreshing(true)
+        setError(null)
+      }
       const res = await fetchJson(`/api/extensions/catalog`)
-      if (!res.ok) throw new Error(`HTTP ${res.status}`)
-      setCatalog(await res.json())
+      if (!res.ok) {
+        if (background) return null
+        throw new Error(`HTTP ${res.status}`)
+      }
+      const data = await res.json()
+      if (request !== catalogRequest.current) return null
+      setCatalog(data)
+      return data
     } catch (err) {
+      if (request !== catalogRequest.current) return null
+      if (background) throw err
       setError(err.name === 'AbortError' ? 'Request timed out' : 'Failed to load extensions catalog')
       console.error('Extensions fetch error:', err)
+      return null
     } finally {
-      setLoading(false)
-      setRefreshing(false)
+      if (request === catalogRequest.current) {
+        catalogPending.current = false
+        setLoading(false)
+        setRefreshing(false)
+      }
     }
   }
 
@@ -471,7 +493,11 @@ export default function Extensions({ compact = false }) {
         throw new Error(typeof error.detail === 'string' ? error.detail : 'Could not add Open WebUI')
       }
       await Promise.all([fetchCatalog(), fetchWebuiSelection()])
-      setToast({ type: 'success', text: 'Open WebUI added. Existing chat data was preserved.' })
+      // Selection is host-owned, but the catalog's health cache may still be
+      // catching up (or its immediate probe may have failed). Follow readiness
+      // without repeating Add; only catalog health exposes the launch link.
+      setToast({ type: 'info', text: 'Open WebUI selected. Waiting for its service to become ready.' })
+      pollProgress('open-webui')
     } catch (error) {
       await fetchWebuiSelection()
       setToast({ type: 'error', text: friendlyError(error.message) || 'Could not add Open WebUI. Check its selection before retrying.' })
@@ -562,6 +588,16 @@ export default function Extensions({ compact = false }) {
     return (
       <div className="p-8 flex items-center justify-center h-64">
         <Loader2 className="animate-spin text-theme-accent" size={32} />
+      </div>
+    )
+  }
+
+  if (!catalog && error) {
+    return (
+      <div className="p-6" role="alert">
+        <h2 className="text-sm font-semibold text-theme-text">Extension catalog unavailable</h2>
+        <p className="mt-2 text-sm text-theme-text-secondary">{error}. The extension list could not be read.</p>
+        <button className="mt-3 underline" onClick={fetchCatalog}>Retry</button> · <HelpLink />
       </div>
     )
   }
@@ -837,7 +873,8 @@ export default function Extensions({ compact = false }) {
 }
 
 function StatusBadge({ status, statusStyle, ext, gpuBackend, onConsole }) {
-  let tooltip = STATUS_DESCRIPTIONS[status] || ''
+  const runtimeStarting = status === 'installing' && ext.runtime_starting === true
+  let tooltip = runtimeStarting ? 'Service is starting; waiting for its health check' : STATUS_DESCRIPTIONS[status] || ''
   if (status === 'incompatible') {
     tooltip += ` \u2014 requires ${ext.gpu_backends?.join(' or ') || 'specific GPU'}, your system: ${gpuBackend || 'unknown'}`
   }
@@ -845,7 +882,7 @@ function StatusBadge({ status, statusStyle, ext, gpuBackend, onConsole }) {
   const badge = (status === 'installing' || status === 'setting_up') ? (
     <span className="text-[10px] px-2 py-0.5 rounded-full bg-blue-500/20 text-blue-400 flex items-center gap-1 cursor-help">
       <Loader2 size={8} className="animate-spin" />
-      {status === 'setting_up' ? 'setting up' : 'installing'}
+      {runtimeStarting ? 'starting' : status === 'setting_up' ? 'setting up' : 'installing'}
     </span>
   ) : status === 'error' ? (
     <span
@@ -908,11 +945,12 @@ function ExtensionCard({ ext, hermesProxy, gpuBackend, agentAvailable, onDetails
   const isUserExt = ext.source === 'user'
   const isManagedBuiltin = isCore && ext.library_manageable === true
   const isError = status === 'error'
+  const runtimeStarting = status === 'installing' && ext.runtime_starting === true
   // A saved progress record can describe a terminal failure or completion.
   // Only active phases should keep the installation spinner on screen.
-  const showProgress = !isError && (progressData?.status
+  const showProgress = !isError && (runtimeStarting || (progressData?.status
     ? ['pulling', 'starting', 'setup_hook'].includes(progressData.status)
-    : status === 'installing' || status === 'setting_up')
+    : status === 'installing' || status === 'setting_up'))
   const isStopped = status === 'stopped'
   const isUnhealthy = status === 'unhealthy'
   const isCliInstalled = status === 'cli_installed'
@@ -990,7 +1028,7 @@ function ExtensionCard({ ext, hermesProxy, gpuBackend, agentAvailable, onDetails
       {showProgress && (
         <div className="px-4 py-2 border-t border-theme-border/40 text-[10px] text-blue-400/80 flex items-center gap-2">
           <Loader2 size={12} className="animate-spin" />
-          <span>{progressData?.phase_label || (progressData?.status === 'setup_hook' || status === 'setting_up' ? 'Running setup...' : 'Installing...')}</span>
+          <span>{runtimeStarting ? 'Starting service — waiting for health check...' : progressData?.phase_label || (progressData?.status === 'setup_hook' || status === 'setting_up' ? 'Running setup...' : 'Installing...')}</span>
         </div>
       )}
       {/* Error message — expandable when long or multiline so docker-compose
@@ -1350,14 +1388,14 @@ function DetailModal({ ext, gpuBackend, onClose }) {
             </div>
           )}
 
-          {/* CLI Commands */}
-          <div>
+          {/* The CLI refuses selection changes for category=core services. */}
+          {ext.category !== 'core' && <div>
             <h4 className="text-xs font-medium text-theme-text-muted uppercase tracking-wider mb-2">CLI Commands</h4>
             <div className="space-y-1">
               <CopyableCommand command={`ods enable ${ext.id}`} />
               <CopyableCommand command={`ods disable ${ext.id}`} />
             </div>
-          </div>
+          </div>}
         </div>
       </div>
     </div>

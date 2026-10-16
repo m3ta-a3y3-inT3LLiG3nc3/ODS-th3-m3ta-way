@@ -23,8 +23,9 @@ from starlette.requests import ClientDisconnect
 
 import hermes_bridge
 import session_signer
-from config import INSTALL_DIR, SERVICES
+from config import INSTALL_DIR, SERVICES, read_live_env_value
 from helpers import check_service_health, get_llama_context_size, get_llama_vision_support, get_loaded_model
+from host_agent_client import AgentClientError, async_request_json as request_agent_json
 from performance_oracle import (
     find_catalog_model,
     load_model_catalog,
@@ -96,6 +97,23 @@ def _configured_context_length() -> int | None:
     return None
 
 
+async def _active_model_profile_tools() -> bool | None:
+    """The active model's measured tool-call result, with profiles enabled only.
+
+    The host reports it in ``activeModelProfile``; it feeds an advisory, never
+    a block (no probe result locks an owner out of chat).
+    """
+    if read_live_env_value("ODS_MODEL_PROFILES").strip().lower() != "enabled":
+        return None
+    try:
+        status = await request_agent_json("GET", "/v1/model/status", timeout=2.0)
+    except AgentClientError:
+        return None
+    profile = status.get("activeModelProfile") if isinstance(status, dict) else None
+    tools = profile.get("tools") if isinstance(profile, dict) else None
+    return tools if isinstance(tools, bool) else None
+
+
 async def _active_model_app_compatibility() -> dict[str, Any]:
     catalog = load_model_catalog(INSTALL_DIR)
     loaded_model = await get_loaded_model()
@@ -121,6 +139,7 @@ async def _active_model_app_compatibility() -> dict[str, Any]:
         entry or {},
         runtime_context=runtime_context,
         context_length=served_context,
+        profile_tools=await _active_model_profile_tools(),
     )
     compatibility["activeModel"] = {
         "id": entry.get("id") if entry else None,

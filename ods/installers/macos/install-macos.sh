@@ -2390,6 +2390,11 @@ else
         macos_resolve_checkpoint_args "$INSTALL_DIR" "$LLAMA_SERVER_BIN" "$_reasoning_fmt" || exit 1
         _llama_args+=(${MACOS_NATIVE_CHECKPOINT_ARGS[@]+"${MACOS_NATIVE_CHECKPOINT_ARGS[@]}"})
         fi
+        # The projector the host agent's switch launches with: a qualified profile's
+        # or a vision import's own (WP2), so a restart keeps the model's vision.
+        [[ -n "${MACOS_NATIVE_PROJECTOR_PATH:-}" ]] && _llama_args+=(--mmproj "$MACOS_NATIVE_PROJECTOR_PATH")
+        # A fixed chat template the switch chose for an exact template match (WP5).
+        [[ -n "${MACOS_NATIVE_CHAT_TEMPLATE_PATH:-}" ]] && _llama_args+=(--chat-template-file "$MACOS_NATIVE_CHAT_TEMPLATE_PATH")
 
         _macos_stop_install_owned_native_llama \
             "Stopping prior install-owned native inference before replacement..."
@@ -3219,7 +3224,7 @@ fi
     if $ENABLE_OPENCODE && [[ -x "$OPENCODE_BIN" ]]; then
         printf 'OpenCode (IDE)|http://127.0.0.1:%s||http://localhost:%s\n' "$OPENCODE_PORT" "$OPENCODE_PORT"
     fi
-} | ods_readiness_summary "./ods-macos.sh status" "$ODS_LOG_FILE" "http://localhost:3001"
+} | ods_readiness_summary "./ods-macos.sh status" "$ODS_LOG_FILE" "http://localhost:3001" "Dashboard"
 
 # get-ods.sh --force exports this when the reinstall removed a saved one.
 if [[ "${ODS_REINSTALL_REMOTE_ROUTE_REMOVED:-false}" == "true" ]]; then

@@ -487,16 +487,49 @@ upsert_env_value() {
     local env_file="$1"
     local key="$2"
     local value="$3"
-    if grep -qE "^${key}=" "$env_file" 2>/dev/null; then
-        sed -i '' "s|^${key}=.*|${key}=${value}|" "$env_file"
-    else
-        # Appending after a last line that has no newline would join the new
-        # assignment onto that line and corrupt both keys.
-        if [[ -s "$env_file" && -n "$(tail -c 1 "$env_file")" ]]; then
-            printf '\n' >> "$env_file"
+    # The live file may be bind-mounted, so retain its inode. Stage and back up
+    # private copies before opening it for writing; a recoverable copy failure
+    # can then be rolled back without leaving a truncated or exposed .env.
+    (
+        umask 077
+        [[ ! -L "$env_file" && ( ! -e "$env_file" || -f "$env_file" ) ]] || return 1
+        stage_dir="$(mktemp -d "${env_file}.stage.XXXXXX")" || return 1
+        staged="$stage_dir/next"
+        backup=""
+        preserve_backup=false
+        found=false
+        trap 'rm -f "$staged"; if [[ "$preserve_backup" == false ]]; then if [[ -n "$backup" ]]; then rm -f "$backup"; fi; rmdir "$stage_dir"; fi' EXIT
+        if [[ -f "$env_file" ]]; then
+            backup="$stage_dir/previous"
+            cp "$env_file" "$backup" || return 1
+            cmp -s "$env_file" "$backup" || return 1
+            : > "$staged" || return 1
+            while IFS= read -r line || [[ -n "$line" ]]; do
+                if [[ "$line" == "$key="* ]]; then
+                    printf '%s=%s\n' "$key" "$value" || return 1
+                    found=true
+                else
+                    printf '%s\n' "$line" || return 1
+                fi
+            done < "$env_file" > "$staged" || return 1
+            if [[ "$found" == false ]]; then
+                printf '%s=%s\n' "$key" "$value" >> "$staged" || return 1
+            fi
+            if ! cat "$staged" > "$env_file" || ! cmp -s "$staged" "$env_file"; then
+                if ! cp "$backup" "$env_file" || ! cmp -s "$backup" "$env_file"; then
+                    preserve_backup=true
+                    echo "ERROR: failed to restore $env_file after an incomplete write; original retained at $backup" >&2
+                    return 1
+                fi
+                return 1
+            fi
+        else
+            printf '%s=%s\n' "$key" "$value" > "$staged" || return 1
+            # A hard link publishes the private file without replacing a path
+            # that another process created while we were staging it.
+            ln "$staged" "$env_file" || return 1
         fi
-        printf '%s=%s\n' "$key" "$value" >> "$env_file"
-    fi
+    )
 }
 
 ensure_hermes_dashboard_session_token() {
@@ -781,6 +814,11 @@ start_native_llama() {
     macos_resolve_checkpoint_args "$INSTALL_DIR" "$LLAMA_SERVER_BIN" "$reasoning_fmt" || return 1
     llama_args+=(${MACOS_NATIVE_CHECKPOINT_ARGS[@]+"${MACOS_NATIVE_CHECKPOINT_ARGS[@]}"})
     fi
+    # The projector the host agent's switch launches with: a qualified profile's
+    # or a vision import's own (WP2), so a restart keeps the model's vision.
+    [[ -n "${MACOS_NATIVE_PROJECTOR_PATH:-}" ]] && llama_args+=(--mmproj "$MACOS_NATIVE_PROJECTOR_PATH")
+    # A fixed chat template the switch chose for an exact template match (WP5).
+    [[ -n "${MACOS_NATIVE_CHAT_TEMPLATE_PATH:-}" ]] && llama_args+=(--chat-template-file "$MACOS_NATIVE_CHAT_TEMPLATE_PATH")
 
     # Artifact and argument verification must precede termination of working inference.
     [[ "$replace" != true ]] || stop_native_llama
@@ -989,6 +1027,12 @@ cmd_start() {
 
 cmd_stop() {
     local service="${1:-}"
+    if [[ "$service" == "llama-server" || "$service" == "llama" ]]; then
+        test_install_dir
+        cd "$INSTALL_DIR"
+        stop_native_llama
+        return $?
+    fi
     test_install
     cd "$INSTALL_DIR"
 
@@ -1208,7 +1252,7 @@ cmd_chat() {
 cmd_update_pixel() {
     test_install
     /usr/bin/python3 "${INSTALL_DIR}/installers/macos/lib/pixel-native-update.py" \
-        --install-dir "$INSTALL_DIR" --ods-source "$INSTALL_DIR" "$@"
+        --install-dir "$INSTALL_DIR" --ods-source "$INSTALL_DIR" --prompt-for-sudo "$@"
 }
 
 cmd_update() {

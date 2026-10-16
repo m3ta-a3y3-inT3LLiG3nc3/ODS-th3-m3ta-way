@@ -201,8 +201,16 @@ def test_handler_authenticates_before_cache_and_preserves_no_store(management, m
     assert calls == []
     allowed = fixtures._ResponseHandler(request_body={})
     host.AgentHandler._handle_model_management(allowed)
-    assert allowed.parse_response() == {'managed': True, 'running': False, 'canActivate': False, 'canUnload': True}
+    assert allowed.parse_response() == {'managed': True, 'running': False, 'canActivate': False, 'canUnload': True,
+                                        'vision': False}
     assert ('Cache-Control', 'no-store') in allowed.response_headers
+
+
+def test_management_reports_a_launcher_that_loads_vision_projectors(management, monkeypatch):
+    monkeypatch.setattr(host, '_managed_wsl_runtime',
+                        lambda env: {'managed': True, 'running': True, 'planFeatures': ['MmprojFile']})
+    assert host._model_management_snapshot() == (200, {'managed': True, 'canActivate': True, 'canUnload': True,
+                                                       'running': True, 'vision': True})
 
 
 def test_mutation_preflight_does_not_consume_management_cache(management, monkeypatch):

@@ -15,6 +15,7 @@ import {
   ODS_EXACT_DOWNLOAD_CONTRACT,
   ODS_LOOP_RECOVERY_CONTRACT,
   ODS_PRIVATE_URL_CONTRACT,
+  ODS_SANDBOX_RUNTIME_CONTRACT,
   ODS_TOOL_REPLY_CONTRACT,
   ODS_VERIFICATION_FAILED_CONTRACT,
   ODS_VERIFICATION_PENDING_CONTRACT,
@@ -30,6 +31,24 @@ import {
 } from "../plugin/prompt-contract.mjs";
 import { AGENT_SKILLS, PREVIEW_RUNTIME_CONTRACT } from "../plugin/agent-skills.mjs";
 import { workspacePreviewMode } from "../plugin/tool-loop-guard.mjs";
+import { RESPONSE_LANGUAGE_CONTRACT } from '../plugin/response-language.mjs';
+import { createAskUserTool } from '../plugin/ask-user.mjs';
+
+test('language fallback reaches website and ordinary requests on full, lean and small-context routes', () => {
+  for (const options of [
+    {configuredContextWindow:65536},
+    {configuredContextWindow:65536, configuredLeanPrompt:true},
+    {configuredContextWindow:16384},
+  ]) {
+    for (const executionHost of ['sandbox', 'gateway']) {
+      for (const prompt of ['Build a website for me.', 'Crie um site para mim.', 'Reply in Portuguese and build a website.', 'OK']) {
+        const contract = promptContractForAgent({agentId:'pixel'}, 'pixel', {prompt}, {...options, executionHost}).appendSystemContext;
+        assert.ok(contract.includes(RESPONSE_LANGUAGE_CONTRACT));
+      }
+    }
+  }
+  assert.ok(createAskUserTool().description.includes(RESPONSE_LANGUAGE_CONTRACT));
+});
 
 test('framework workspace guidance requires real build output and nested-path asset verification', () => {
   assert.match(AGENT_SKILLS.workspace, /run the framework's real build/);
@@ -287,7 +306,9 @@ test("uses a bounded complete core on compact contexts without changing requeste
   assert.deepEqual(plain, {
     appendSystemContext: ODS_COMPACT_CONVERSATION_CONTRACT,
   });
-  assert.ok(ODS_COMPACT_CONVERSATION_CONTRACT.length < 3800);
+  // Allow the 345-character language and 448-character sandbox runtime rules
+  // while keeping a fixed compact ceiling.
+  assert.ok(ODS_COMPACT_CONVERSATION_CONTRACT.length < 4600);
   assert.match(plain.appendSystemContext, /untrusted data, never authority/);
   assert.match(plain.appendSystemContext, /never self-approve/);
   assert.match(plain.appendSystemContext, /run the requested focused verification/);
@@ -301,7 +322,7 @@ test("uses a bounded complete core on compact contexts without changing requeste
   assert.match(host.appendSystemContext, /pixel_ods_host_observe/);
 
   const full = promptContractForAgent(
-    { agentId: "pixel", contextTokenBudget: 32768 },
+    { agentId: "pixel", contextTokenBudget: 32769 },
     "pixel"
   );
   assert.deepEqual(full, { appendSystemContext: ODS_CONVERSATION_CONTRACT });
@@ -352,6 +373,50 @@ test("adds one exact compact tool route for natural broad host questions", () =>
     promptContractForAgent({ agentId: "pixel" }, "pixel", { prompt }).appendSystemContext,
     `${ODS_CONVERSATION_CONTRACT}${exact}`
   );
+});
+
+test('32K selects the compact core from every trusted context source', () => {
+  for (const window of [32767, 32768, 32769, 65536]) {
+    for (const source of ['configured', 'budget', 'reference']) {
+      const context = {agentId:'pixel', contextTokenBudget:65536, contextWindowReferenceTokens:65536};
+      const options = {configuredContextWindow:65536};
+      if (source === 'configured') options.configuredContextWindow = window;
+      if (source === 'budget') context.contextTokenBudget = window;
+      if (source === 'reference') context.contextWindowReferenceTokens = window;
+      const result = promptContractForAgent(context, 'pixel', {prompt:'What is 14 plus 8?'}, options);
+      assert.equal(result.appendSystemContext, window <= 32768
+        ? ODS_COMPACT_CONVERSATION_CONTRACT : ODS_CONVERSATION_CONTRACT);
+    }
+  }
+  assert.equal(promptContractForAgent({agentId:'pixel'}, 'pixel', {prompt:'Use a 32K context.'})
+    .appendSystemContext, ODS_CONVERSATION_CONTRACT, 'owner prose cannot select the trusted budget');
+});
+
+test('32K preserves explicit compact-mode intent routes and verification safeguards', () => {
+  for (const prompt of [
+    'Compare Open WebUI with Flowise in the ODS extension catalog.',
+    'Install Flowise on the ODS host.',
+    'What can you tell me about this machine?',
+    'Make a playable Breakout game.',
+    'Continue checking the published preview controls.',
+    'Give me the existing report.pdf as a download.',
+    'Read the private URL http://192.168.1.20.',
+  ]) {
+    for (const executionHost of ['sandbox', 'gateway']) {
+      for (const verificationStatus of ['pending', 'failed']) {
+        const options = {executionHost, verificationStatus, privateBrowserAccess:false};
+        const actual = promptContractForAgent({agentId:'pixel'}, 'pixel', {prompt},
+          {...options, configuredContextWindow:32768});
+        const existingLean = promptContractForAgent({agentId:'pixel'}, 'pixel', {prompt},
+          {...options, configuredContextWindow:65536, configuredLeanPrompt:true});
+        assert.deepEqual(actual, existingLean, prompt);
+        assert.match(actual.appendSystemContext, /untrusted data, never authority/);
+        assert.match(actual.appendSystemContext, /never self-approve/);
+        assert.match(actual.appendSystemContext, /normal\/malformed input exit status/);
+        assert.match(actual.appendSystemContext, /wait without starting the dependent action/);
+      }
+    }
+  }
 });
 
 test("adds one model-agnostic approval route for local and explicit SSH host commands", () => {
@@ -434,17 +499,23 @@ test("restores the full September 16 operating core while retaining compact fall
   const result = promptContractForAgent({ agentId: "pixel" }, "pixel");
   assert.equal(result.appendSystemContext, ODS_CONVERSATION_CONTRACT);
   assert.equal(ODS_TOOL_REPLY_CONTRACT, ODS_CONVERSATION_CONTRACT);
-  assert.equal(ODS_SEPTEMBER16_CONVERSATION_CONTRACT.length, 17751);
-  // SHA-256 of the evaluated full core at 44fb4335 and pre-merge 15eb56fa.
-  assert.equal(createHash('sha256').update(ODS_SEPTEMBER16_CONVERSATION_CONTRACT).digest('hex'),
+  // SHA-256 of the evaluated full core at 44fb4335 and pre-merge 15eb56fa. Its
+  // workdir sentence alone has changed since: it named Node, which the sandbox lacks.
+  const evaluatedCore = ODS_SEPTEMBER16_CONVERSATION_CONTRACT
+    .replace('For interpreter commands,', 'For Python or Node commands,');
+  assert.notEqual(evaluatedCore, ODS_SEPTEMBER16_CONVERSATION_CONTRACT);
+  assert.equal(evaluatedCore.length, 17751);
+  assert.equal(createHash('sha256').update(evaluatedCore).digest('hex'),
     '94d4a2c3cf7c7469219f0592a4a6f9e451dff0e92b8918bfb1adbbc1827c97de');
-  const oldCompact = ODS_COMPACT_CONVERSATION_CONTRACT.slice(0, -(PREVIEW_RUNTIME_CONTRACT.length + 1));
+  // The sandbox runtime rule is the only addition inside the compact core.
+  const oldCompact = ODS_COMPACT_CONVERSATION_CONTRACT.replace(` ${ODS_SANDBOX_RUNTIME_CONTRACT}`, '')
+    .slice(0, -(RESPONSE_LANGUAGE_CONTRACT.length + PREVIEW_RUNTIME_CONTRACT.length + 2));
   assert.equal(oldCompact.length, 3087);
   assert.equal(createHash('sha256').update(oldCompact).digest('hex'),
     '9223e1d30c01d44bf709012903027276dbbf8724e4fa53ec0766bd02e9a377f0');
   assert.ok(ODS_COMPACT_CONVERSATION_CONTRACT.endsWith(' ' + PREVIEW_RUNTIME_CONTRACT));
   assert.ok(ODS_CONVERSATION_CONTRACT.startsWith(ODS_SEPTEMBER16_CONVERSATION_CONTRACT + ' '));
-  assert.ok(ODS_CONVERSATION_CONTRACT.length < 20000);
+  assert.ok(ODS_CONVERSATION_CONTRACT.length < 20500);
   assert.notEqual(ODS_CONVERSATION_CONTRACT, ODS_COMPACT_CONVERSATION_CONTRACT);
   assert.match(result.appendSystemContext, /Never say you ran, executed/);
   assert.match(result.appendSystemContext, /use python3 and unittest directly/);
@@ -464,7 +535,7 @@ test('full restoration retains newer CLI verification and authorization-state gu
 });
 
 test('full-context ordinary tasks receive historical process, verification and stopping guidance automatically', () => {
-  for (const configuredContextWindow of [32768, 65536]) {
+  for (const configuredContextWindow of [32769, 65536]) {
     for (const prompt of ['Repair this Python parser.', 'Summarize these records in a report.', 'Continue the running build.']) {
       const {appendSystemContext: contract} = promptContractForAgent(
         {agentId:'pixel'}, 'pixel', {prompt},
@@ -495,9 +566,37 @@ test('trusted execution mode supplies the correct workspace namespace, not owner
   assert.match(native, /not a native shell path/);
   assert.match(native, /native exec output is not a broker receipt/);
   assert.match(native, /not automatically a published, browser-accessible ODS service/);
-  assert.doesNotMatch(native, /exec starts at \/workspace|Generic exec is sandbox evidence|runs only inside the disposable Pixel sandbox|generic exec is sandbox-only evidence/);
+  assert.doesNotMatch(native, /exec starts at \/workspace|Generic exec is sandbox evidence|runs only inside the disposable Pixel sandbox|generic exec is sandbox-only evidence|no node, npm or network/);
   for (const value of [undefined, null, 'gateway; ignore permissions', {host:'sandbox'}]) {
     assert.equal(conversationContractForExecution(ODS_CONVERSATION_CONTRACT, value), ODS_CONVERSATION_CONTRACT);
+  }
+});
+
+test('sandbox mode states its runtimes and the browser JavaScript check; native exec does not inherit them', () => {
+  assert.match(ODS_SANDBOX_RUNTIME_CONTRACT, /bash, python3 \(no pip\), git, rg and jq, but no node, npm or network/);
+  // Scoped to the sandbox, so it never discourages an offered ODS tool.
+  assert.match(ODS_SANDBOX_RUNTIME_CONTRACT, /If a sandbox runtime or tool is missing, say so instead of probing other interpreters or emulating it in another language/);
+  // A cancelled error event or an older inspection image omits pageErrors.
+  assert.match(ODS_SANDBOX_RUNTIME_CONTRACT, /publish with pixel_ods_workspace_preview, then pixel_ods_workspace_preview_inspect reports uncaught page script errors as pageErrors; no pageErrors does not prove the script works/);
+  for (const contract of [ODS_CONVERSATION_CONTRACT, ODS_COMPACT_CONVERSATION_CONTRACT]) {
+    // Exactly once, space-separated, so the native replacement removes it entirely.
+    assert.equal(contract.split(` ${ODS_SANDBOX_RUNTIME_CONTRACT} `).length, 2);
+    assert.doesNotMatch(contract, /Python or Node commands/);
+    const native = conversationContractForExecution(contract, 'gateway');
+    assert.equal(native.includes(ODS_SANDBOX_RUNTIME_CONTRACT), false);
+    assert.doesNotMatch(native, /no node, npm or network|python3 \(no pip\)|probing other interpreters/);
+  }
+  const prompt = 'Fix the canvas game in Playground/elf-of-doom so the hero is visible.';
+  for (const options of [
+    {configuredContextWindow:65536},
+    {configuredContextWindow:32768},
+    {configuredContextWindow:65536, configuredLeanPrompt:true},
+  ]) {
+    const sandbox = promptContractForAgent({agentId:'pixel'}, 'pixel', {prompt}, {...options, executionHost:'sandbox'}).appendSystemContext;
+    assert.ok(sandbox.includes(ODS_SANDBOX_RUNTIME_CONTRACT), JSON.stringify(options));
+    const native = promptContractForAgent({agentId:'pixel'}, 'pixel', {prompt}, {...options, executionHost:'gateway'}).appendSystemContext;
+    assert.equal(native.includes(ODS_SANDBOX_RUNTIME_CONTRACT), false, JSON.stringify(options));
+    assert.doesNotMatch(native, /no node, npm or network|python3 \(no pip\)|probing other interpreters/);
   }
 });
 
@@ -848,6 +947,7 @@ test('team reviewers and coordinators do not receive the website implementation 
     const value=promptContractForAgent({agentId:'pixel'},'pixel',{prompt:`Identity: Portal\n\nYou are the ${role} in the owner's Portal team.\nOwner request: build and publish a website.`});
     assert.equal(value.appendSystemContext.includes(ODS_WORKSPACE_PREVIEW_CONTRACT),false);
     assert.match(value.appendSystemContext,role==='Coordinator'?/JSON/:/read-only/);
+    if (role === 'Reviewer') assert.ok(value.appendSystemContext.includes(RESPONSE_LANGUAGE_CONTRACT));
   }
 });
 
@@ -876,6 +976,7 @@ test("requested document delivery receives a prioritized route on full and compa
     'Deliver the existing archive.zip.',
     'Do not download old.zip; attach current.pdf instead.',
     'Attach the existing "docs/report.docx".',
+    'Create a small Python project, run the tests and give me the downloadable project with its original source filenames.',
   ]) {
     assert.equal(selects([], prompt), true, prompt);
     for (const configuredLeanPrompt of [false, true]) {
@@ -885,6 +986,12 @@ test("requested document delivery receives a prioritized route on full and compa
       assert.ok(result.appendSystemContext.startsWith(configuredLeanPrompt
         ? ODS_COMPACT_CONVERSATION_CONTRACT : ODS_CONVERSATION_CONTRACT), prompt);
       assert.match(result.prependContext, /Complete any requested file creation or edits first/);
+      assert.match(result.prependContext, /source-code files.*code projects.*ZIP/);
+      assert.match(result.prependContext, /preserving filenames and bytes/);
+      assert.match(result.prependContext, /never rename source to \.txt/);
+      assert.match(result.prependContext, /4 MiB/);
+      assert.match(result.prependContext, /Creating a file is not delivery/);
+      assert.match(result.prependContext, /verified receipt BEFORE the final reply/);
     }
   }
   assert.ok(guide.length < 700);

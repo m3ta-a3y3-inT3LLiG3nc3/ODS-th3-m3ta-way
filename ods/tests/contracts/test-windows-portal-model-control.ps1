@@ -55,7 +55,7 @@ try {
     $script:healthFailure = $false; $script:staleProcess = $false; $script:wrongModel = $false
     $script:failStart = $false; $script:failReady = $false; $script:mutateDuringStop = $false
     $script:probeMutexDuringHealth = $false; $script:replacePlanDuringHealth = $false
-    $script:contextOffset = 0; $script:wrongKey = $false
+    $script:contextOffset = 0; $script:wrongKey = $false; $script:visionLoaded = $true
     $script:events = [Collections.Generic.List[string]]::new()
     $script:queried = [Collections.Generic.List[string]]::new()
     function Get-ScheduledTask { param($TaskName, $TaskPath, $ErrorAction, $ErrorVariable)
@@ -144,7 +144,8 @@ try {
         if ($Path -eq '/props') {
             if ($script:wrongKey -or $ApiKey -cne $script:apiKey) { return [pscustomobject]@{ StatusCode = 401; Body = '{}'; Error = '' } }
             $body = @{ model_path = ('C:\FIXTUR~1\' + $current.GgufFile); total_slots = 1
-                default_generation_settings = @{ n_ctx = $current.ContextSize + $script:contextOffset } } | ConvertTo-Json -Depth 4
+                default_generation_settings = @{ n_ctx = $current.ContextSize + $script:contextOffset }
+                modalities = @{ vision = [bool]($script:visionLoaded -and $current.MmprojFile); audio = $false } } | ConvertTo-Json -Depth 4
             return [pscustomobject]@{ StatusCode = 200; Body = $body; Error = '' }
         }
         throw "unexpected path $Path"
@@ -299,6 +300,44 @@ try {
     $script:occupied = $true
     $null = Assert-ControlError (New-ControlRequest 'stop' (Get-ODSPortalPlanDigest $planPath)) 'stop_unverified'
     $script:occupied = $false
+    # --- Vision projector (WP2): planned only for a launcher that declares it ---
+    [IO.File]::WriteAllText((Join-Path $models 'mmproj-F16.gguf'), 'fixture')
+    function New-VisionRequest([string]$Digest, [string]$Projector = 'mmproj-F16.gguf') {
+        $request = New-ControlRequest 'activate' $Digest
+        $request | Add-Member -NotePropertyName mmproj -NotePropertyValue $Projector
+        return $request
+    }
+    $digest = Get-ODSPortalPlanDigest $planPath
+    Assert-Control (@((Invoke-ODSPortalModelControl (New-ControlRequest 'status')).planFeatures).Count -eq 0) 'a launcher from before vision support declares no plan features'
+    $failure = Assert-ControlError (New-VisionRequest $digest) 'invalid_model'
+    Assert-Control ($failure.Message -match 'before vision support' -and (Get-ODSPortalPlanDigest $planPath) -ceq $digest) 'an older launcher is never planned a projector, and its plan is kept'
+    $optionsPath = Join-Path (Split-Path -Parent $planPath) 'runtime-options.json'
+    $declared = Get-Content -LiteralPath $optionsPath -Raw | ConvertFrom-Json
+    $declared | Add-Member -NotePropertyName PlanFeatures -NotePropertyValue @('MmprojFile', 'Unknown')
+    Write-ODSPrivateEnvFile -Path $optionsPath -Content ($declared | ConvertTo-Json -Depth 4 -Compress)
+    Assert-Control ((@((Invoke-ODSPortalModelControl (New-ControlRequest 'status')).planFeatures) -join ',') -ceq 'MmprojFile') 'status reports only the known plan features the launcher declares'
+    foreach ($bad in @('../mmproj-F16.gguf', 'mmproj.bin', ' mmproj-F16.gguf', 'Small-0.6B.gguf', 'missing-mmproj.gguf')) {
+        $code = if ($bad -eq 'missing-mmproj.gguf') { 'model_missing' } else { 'invalid_model' }
+        $null = Assert-ControlError (New-VisionRequest $digest $bad) $code
+    }
+    Assert-Control ((Get-ODSPortalPlanDigest $planPath) -ceq $digest -and $script:events[-1] -ceq 'stop') 'invalid projector requests keep the plan and start nothing'
+    $script:visionLoaded = $false
+    $failed = $null
+    try { $null = Invoke-ODSPortalModelControl (New-VisionRequest $digest) } catch { $failed = $_.Exception }
+    Assert-Control ($failed.Data['code'] -ceq 'start_unverified' -and $failed.Message -match 'vision projector' -and
+        $failed.Data['newPlanDigest'] -ceq (Get-ODSPortalPlanDigest $planPath)) 'a launch that did not load its projector is never verified'
+    $script:visionLoaded = $true
+    $vision = Invoke-ODSPortalModelControl (New-VisionRequest $failed.Data['newPlanDigest'])
+    Assert-Control ($vision.running -and $vision.plan.MmprojFile -ceq 'mmproj-F16.gguf' -and
+        (Get-Content -LiteralPath $planPath -Raw | ConvertFrom-Json).MmprojFile -ceq 'mmproj-F16.gguf') 'a vision activation persists and proves its projector'
+    Assert-Control ((@($vision.plan.Keys) -join ',') -ceq 'ExecutablePath,Port,ModelsDir,ContextSize,GgufFile,WslDistro,WslInstallDir,MmprojFile') 'the projector is the one optional key, after the keys the WSL bridge requires'
+    $visionPlan = $vision.plan | ConvertTo-Json | ConvertFrom-Json
+    $text = Invoke-ODSPortalModelControl (New-ControlRequest 'activate' $vision.planDigest)
+    Assert-Control ($text.running -and -not $text.plan.Contains('MmprojFile') -and
+        $null -eq (Get-Content -LiteralPath $planPath -Raw | ConvertFrom-Json).MmprojFile) 'switching to a model without a projector clears it'
+    $request = New-ControlRequest 'restore' $text.planDigest; $request.plan = $visionPlan
+    $back = Invoke-ODSPortalModelControl $request
+    Assert-Control ($back.running -and $back.plan.MmprojFile -ceq 'mmproj-F16.gguf' -and $back.observation.modelId -ceq 'Small-0.6B.gguf') 'rollback restores the previous projector with its model'
     # The real entrypoint must return one JSON error and a nonzero process exit.
     # Invalid actions fail before any task/process/network inspection can occur.
     $entry = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '../../installers/windows/portal-model-control.ps1'))

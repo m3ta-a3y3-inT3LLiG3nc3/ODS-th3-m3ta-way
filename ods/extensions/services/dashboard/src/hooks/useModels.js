@@ -1,3 +1,4 @@
+import {modelActivationStatus} from '../lib/modelActivationStatus'
 import { useState, useEffect, useCallback, useRef } from 'react'
 
 // Mock data for development/demo - gated behind VITE_USE_MOCK_DATA env var
@@ -111,8 +112,14 @@ function errorMessageFromPayload(data, fallback) {
   return fallback
 }
 
-async function errorMessageFromResponse(response, fallback) {
-  return errorMessageFromPayload(await responseJson(response), fallback)
+class ModelActionError extends Error {
+  constructor(message, deletionDetail = null) {
+    super(message)
+    // Only a typed, committed deletion outcome authorizes immediate readback.
+    const committedOutcome = deletionDetail?.code === 'model_delete_cleanup_pending' ||
+      deletionDetail?.code === 'model_delete_status_update_failed'
+    this.deletionCommitted = committedOutcome && deletionDetail.deletionCommitted === true
+  }
 }
 
 async function modelActionRequest(url, options, budget, timeoutMessage, failureMessage, expectedStatus = null) {
@@ -128,7 +135,13 @@ async function modelActionRequest(url, options, budget, timeoutMessage, failureM
     await Promise.race([
       (async () => {
         const response = await fetch(url, { ...options, signal: controller.signal })
-        if (!response.ok) throw new Error(await errorMessageFromResponse(response, failureMessage))
+        if (!response.ok) {
+          const data = await responseJson(response)
+          throw new ModelActionError(
+            errorMessageFromPayload(data, failureMessage),
+            options.method === 'DELETE' ? data?.detail : null,
+          )
+        }
         if (expectedStatus && (await responseJson(response)).status !== expectedStatus) {
           throw new Error('The runtime operation was not confirmed. Refresh its status before retrying.')
         }
@@ -235,6 +248,8 @@ export function useModels({observe=true} = {}) {
   const [activationReadyModel, setActivationReadyModel] = useState(USE_MOCK_DATA ? MOCK_CURRENT_MODEL : null)
   const [configuredModel, setConfiguredModel] = useState(USE_MOCK_DATA ? MOCK_CURRENT_MODEL : null)
   const [modelLifecycle, setModelLifecycle] = useState(null)
+  const [modelActivation, setModelActivation] = useState(null)
+  const [modelRecoveryPending, setModelRecoveryPending] = useState(false)
   const [odsMode, setOdsMode] = useState(USE_MOCK_DATA ? MOCK_MODES.odsMode : 'unknown')
   const [configuredMode, setConfiguredMode] = useState(USE_MOCK_DATA ? MOCK_MODES.configuredMode : 'unknown')
   const [llmBackend, setLlmBackend] = useState(USE_MOCK_DATA ? 'llama-server' : 'unknown')
@@ -314,7 +329,11 @@ export function useModels({observe=true} = {}) {
     const controller = new AbortController()
     const cancel = () => controller.abort()
     signal?.addEventListener('abort', cancel, { once: true })
-    const timeout = setTimeout(() => controller.abort(), MODELS_FETCH_TIMEOUT_MS)
+    let timedOut = false
+    const timeout = setTimeout(() => {
+      timedOut = true
+      controller.abort()
+    }, MODELS_FETCH_TIMEOUT_MS)
     try {
       const response = await fetch('/api/models', { signal: controller.signal })
       if (!response.ok) throw new Error('Failed to fetch models')
@@ -334,6 +353,8 @@ export function useModels({observe=true} = {}) {
       setActivationReadyModel(data.activationReadyModel ?? null)
       setConfiguredModel(data.configuredModel ?? null)
       setModelLifecycle(normalizeModelLifecycle(data.modelLifecycle))
+      setModelActivation(modelActivationStatus(data.modelActivation))
+      setModelRecoveryPending(data.modelRecoveryPending === true)
       const effectiveMode = normalizeOdsMode(data.odsMode)
       setOdsMode(effectiveMode)
       setConfiguredMode(normalizeOdsMode(data.configuredMode ?? data.odsMode))
@@ -357,7 +378,10 @@ export function useModels({observe=true} = {}) {
       if (signal?.aborted) return null
       if (requestId >= latestSettledModelsRequestRef.current) {
         latestSettledModelsRequestRef.current = requestId
-        setFetchError(err.message)
+        setFetchError(timedOut
+          ? 'Could not refresh model status within 30 seconds. ODS may still be working; wait for status confirmation before retrying a model change.'
+          : err.message)
+        setModelActivation(null)
         setModelManagement(normalizeModelManagement(null))
       }
       // No silent fallback - let error propagate to UI
@@ -630,6 +654,7 @@ export function useModels({observe=true} = {}) {
       await fetchModels() // Refresh
     } catch (err) {
       setMutationError(err.message)
+      if (err instanceof ModelActionError && err.deletionCommitted) await fetchModels()
     } finally {
       finishAction(action.token)
     }
@@ -678,6 +703,8 @@ export function useModels({observe=true} = {}) {
     activationReadyModel,
     configuredModel,
     modelLifecycle,
+    modelActivation,
+    modelRecoveryPending,
     odsMode,
     configuredMode,
     llmBackend,

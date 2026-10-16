@@ -72,6 +72,20 @@ function Assert-ODSPortalControlModel($Plan) {
         ((Get-Item -LiteralPath $Plan.ModelsDir -Force).Attributes -band [IO.FileAttributes]::ReparsePoint)) {
         Throw-ODSPortalControlError 'model_missing' 'The selected GGUF must exist as a regular file in the managed Windows model store.'
     }
+    if ($Plan.Contains('MmprojFile')) {
+        # A vision projector follows the model's own ASCII basename rule.
+        $projector = $Plan.MmprojFile
+        if ($projector -isnot [string] -or $projector -cnotmatch '^[\x20-\x7e]{1,240}$' -or $projector -notmatch '\.gguf$' -or
+            $projector -match '[\\/:*?"<>|]' -or $projector -ne $projector.Trim() -or $projector.StartsWith('.') -or
+            $projector -ieq $Plan.GgufFile) {
+            Throw-ODSPortalControlError 'invalid_model' 'Select a vision projector by its ASCII GGUF basename, beside the model.'
+        }
+        $file = Join-Path $Plan.ModelsDir $projector
+        if (-not (Test-Path -LiteralPath $file -PathType Leaf) -or
+            ((Get-Item -LiteralPath $file -Force).Attributes -band [IO.FileAttributes]::ReparsePoint)) {
+            Throw-ODSPortalControlError 'model_missing' 'The vision projector must exist as a regular file in the managed Windows model store.'
+        }
+    }
 }
 
 function Get-ODSPortalManagedConfiguration($Request) {
@@ -118,10 +132,16 @@ function Get-ODSPortalManagedConfiguration($Request) {
     foreach ($name in @('ExecutablePath', 'Port', 'ModelsDir', 'ContextSize', 'GgufFile', 'WslDistro', 'WslInstallDir')) {
         $plan[$name] = $saved.$name
     }
+    if ($null -ne $saved.MmprojFile) { $plan.MmprojFile = $saved.MmprojFile }
+    # Optional plan fields the installed launcher declared it reads; a launcher
+    # from before vision support declares none and is never handed a projector.
+    $options = [Text.UTF8Encoding]::new($false, $true).GetString(
+        (Read-ODSPortalPlanBytes (Join-Path $runtimeDir 'runtime-options.json'))) | ConvertFrom-Json -ErrorAction Stop
+    $features = @(@($options.PlanFeatures) | Where-Object { $_ -is [string] -and $_ -cin @('MmprojFile') })
     $taskName = if ($tasks[0].TaskName) { $tasks[0].TaskName } else { Get-ODSPortalRuntimeTaskName }
     return [pscustomobject]@{ Task = $tasks[0]; TaskName = $taskName; ShellPath = $shell[0].Source; Plan = $plan
         PlanPath = $path; PlanDigest = $digest; ReadyPath = Join-Path $runtimeDir 'ready.json'
-        ApiKeyPath = Join-Path $runtimeDir 'api-key' }
+        ApiKeyPath = Join-Path $runtimeDir 'api-key'; Features = $features }
 }
 
 function Get-ODSPortalManagedObservation($Configuration) {
@@ -145,7 +165,7 @@ function Get-ODSPortalManagedObservation($Configuration) {
         $apiKey = Read-ODSNativeLlamaApiKey $Configuration.ApiKeyPath
         $proof = Get-ODSNativeLlamaModelProof -Port $plan.Port -GgufFile $plan.GgufFile `
             -ModelPaths @((Join-Path $plan.ModelsDir $plan.GgufFile), (ConvertTo-ODSNativeLlamaArgumentPath (Join-Path $plan.ModelsDir $plan.GgufFile))) `
-            -ContextSize $plan.ContextSize -ApiKey $apiKey
+            -ContextSize $plan.ContextSize -ApiKey $apiKey -Vision:($plan.Contains('MmprojFile'))
         Assert-ODSNativeLlamaListener $plan.Port $ready.ProcessId $plan.ExecutablePath
         if ($process.HasExited) { throw 'The managed Windows process exited during model verification.' }
         return [ordered]@{ status = 'verified'; modelId = [string]$proof.ModelId; contextLength = [long]$proof.ContextLength }
@@ -155,7 +175,7 @@ function Get-ODSPortalManagedObservation($Configuration) {
 function Get-ODSPortalControlStatus($Configuration, [switch]$SkipObservation) {
     $result = [ordered]@{ ok = $true; managed = $true; running = $false; observation = $null
         modelStoreWindowsPath = $Configuration.Plan.ModelsDir; planPathWindows = $Configuration.PlanPath
-        planDigest = $Configuration.PlanDigest; plan = $Configuration.Plan }
+        planDigest = $Configuration.PlanDigest; plan = $Configuration.Plan; planFeatures = @($Configuration.Features) }
     if (-not $SkipObservation -and (Test-Path -LiteralPath $Configuration.ReadyPath -PathType Leaf)) {
         try {
             $result.observation = Get-ODSPortalManagedObservation $Configuration
@@ -221,6 +241,14 @@ function Invoke-ODSPortalModelControl($Request) {
         if ($Request.action -ceq 'activate') {
             $next.GgufFile = $Request.gguf
             $next.ContextSize = $Request.contextSize
+            # Every switch states its projector; a model without one clears it.
+            $next.Remove('MmprojFile')
+            if ($null -ne $Request.mmproj) {
+                if ('MmprojFile' -cnotin $configuration.Features) {
+                    Throw-ODSPortalControlError 'invalid_model' 'This Windows model runtime was set up before vision support. Run Windows setup again to load vision models with their projector.'
+                }
+                $next.MmprojFile = $Request.mmproj
+            }
         } elseif ($Request.action -ceq 'restore') {
             if ($null -eq $Request.plan -or $Request.plan -is [array]) {
                 Throw-ODSPortalControlError 'invalid_plan' 'Restore requires the previous verified plan.'
@@ -231,6 +259,8 @@ function Invoke-ODSPortalModelControl($Request) {
             }
             $next.GgufFile = $Request.plan.GgufFile
             $next.ContextSize = $Request.plan.ContextSize
+            $next.Remove('MmprojFile')
+            if ($null -ne $Request.plan.MmprojFile) { $next.MmprojFile = $Request.plan.MmprojFile }
         }
         if ($Request.action -cne 'stop') { Assert-ODSPortalControlModel $next }
         if ($Request.action -ceq 'start') {

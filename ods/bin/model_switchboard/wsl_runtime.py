@@ -31,6 +31,9 @@ _SOURCE = Path(__file__).resolve().parents[2]
 _DIGEST = re.compile(r"[0-9a-f]{64}")
 _PLAN_KEYS = {"ExecutablePath", "Port", "ModelsDir", "ContextSize", "GgufFile",
               "WslDistro", "WslInstallDir"}
+# A vision model's projector, beside its weights. Only a launcher whose
+# options declare it (status ``planFeatures``) is planned one.
+_PROJECTOR_KEY = "MmprojFile"
 TRANSPORT_KEY = "ODS_HOST_LLM_TRANSPORT"
 HOST_BASE_URL_KEY = "NATIVE_LLM_BASE_URL"
 CONTAINER_BASE_URL_KEY = "NATIVE_LLM_CONTAINER_BASE_URL"
@@ -253,15 +256,20 @@ def _context(install_dir: Path, env: dict) -> _Context:
     return _Context(match[1], root.as_posix(), _path(str(controller), "-w"), windows)
 
 
+def _projector(gguf, projector) -> bool:
+    return _gguf(projector) and projector.casefold() != str(gguf).casefold()
+
+
 def _plan(plan, context: _Context) -> None:
-    if not isinstance(plan, dict) or set(plan) != _PLAN_KEYS:
+    if not isinstance(plan, dict) or set(plan) - {_PROJECTOR_KEY} != _PLAN_KEYS:
         raise ValueError("Invalid Windows runtime plan schema")
     if (not isinstance(plan["WslDistro"], str) or plan["WslDistro"].casefold() != context.distro.casefold()
             or plan["WslInstallDir"] != context.install_dir
             or not _windows_path(plan["ExecutablePath"]) or not _windows_path(plan["ModelsDir"])
             or not _gguf(plan["GgufFile"]) or type(plan["Port"]) is not int
             or not 1 <= plan["Port"] <= 65535 or type(plan["ContextSize"]) is not int
-            or not 4096 <= plan["ContextSize"] <= 262144):
+            or not 4096 <= plan["ContextSize"] <= 262144
+            or (_PROJECTOR_KEY in plan and not _projector(plan["GgufFile"], plan[_PROJECTOR_KEY]))):
         raise ValueError("Windows runtime plan does not match this installation")
 
 
@@ -273,6 +281,9 @@ def _response(value, context: _Context) -> dict:
     if not value["managed"]:
         return value
     _plan(value.get("plan"), context)
+    features = value.get("planFeatures", [])
+    if not isinstance(features, list) or len(features) > 16 or not all(_text(item, 64) for item in features):
+        raise BridgeError("Windows controller returned invalid plan features")
     if (not isinstance(value.get("planDigest"), str) or not _DIGEST.fullmatch(value["planDigest"])
             or value.get("modelStoreWindowsPath") != value["plan"]["ModelsDir"]):
         raise BridgeError("Windows controller returned an invalid plan identity")
@@ -441,17 +452,30 @@ def _mutate(install_dir: Path, env: dict, action: str, expected_plan_digest: str
     target = values.get("plan") if action == "restore" else current["plan"]
     gguf = values.get("gguf", target["GgufFile"])
     size = values.get("contextSize", target["ContextSize"])
-    if result["plan"]["GgufFile"] != gguf or result["plan"]["ContextSize"] != size:
+    projector = values.get("mmproj") if action == "activate" else target.get(_PROJECTOR_KEY)
+    if (result["plan"]["GgufFile"] != gguf or result["plan"]["ContextSize"] != size
+            or result["plan"].get(_PROJECTOR_KEY) != projector):
         raise BridgeError("Windows controller did not persist the requested model plan")
     if action != "stop" and (not result.get("observation") or result["observation"]["contextLength"] != size):
         raise BridgeError("Windows controller did not prove the requested model context")
     return result
 
 
-def activate(install_dir: Path, env: dict, gguf: str, context_size: int, expected_plan_digest: str) -> dict:
+def supports_projector(value: dict) -> bool:
+    """Does the owned launcher declare that it loads a vision projector?"""
+    return value.get("managed") is True and _PROJECTOR_KEY in value.get("planFeatures", [])
+
+
+def activate(install_dir: Path, env: dict, gguf: str, context_size: int, expected_plan_digest: str,
+             mmproj: str | None = None) -> dict:
     if not _gguf(gguf) or type(context_size) is not int or not 4096 <= context_size <= 262144:
         raise ValueError("A safe GGUF filename and supported context size are required")
-    return _mutate(install_dir, env, "activate", expected_plan_digest, gguf=gguf, contextSize=context_size)
+    if mmproj is None:
+        return _mutate(install_dir, env, "activate", expected_plan_digest, gguf=gguf, contextSize=context_size)
+    if not _projector(gguf, mmproj):
+        raise ValueError("A vision projector needs its own safe GGUF filename")
+    return _mutate(install_dir, env, "activate", expected_plan_digest, gguf=gguf, contextSize=context_size,
+                   mmproj=mmproj)
 
 
 def restore(install_dir: Path, env: dict, plan: dict, expected_plan_digest: str) -> dict:

@@ -2048,3 +2048,65 @@ def test_talk_status_judges_an_import_on_its_live_context_only(talk_client, monk
     )
     data = talk_client.get("/api/talk/status").json()
     assert data["modelCompatibility"]["hermesTalk"].get("code") != "context_below_hermes_minimum"
+
+
+def _patch_profile_status(monkeypatch, *, mode, status):
+    calls = []
+
+    async def host_status(method, path, timeout):
+        calls.append((method, path))
+        if isinstance(status, Exception):
+            raise status
+        return status
+
+    monkeypatch.setattr("routers.talk.read_live_env_value",
+                        lambda key: mode if key == "ODS_MODEL_PROFILES" else "")
+    monkeypatch.setattr("routers.talk.request_agent_json", host_status)
+    return calls
+
+
+def test_talk_status_adds_the_tools_advisory_with_profiles_enabled(talk_client, monkeypatch):
+    # Any-model WP4.4: a failed tool check informs; ODS Talk stays usable.
+    _patch_context_talk(monkeypatch, gguf="Qwen3.5-27B-Q4_K_M.gguf", env={"CTX_SIZE": "65536"},
+                        live_context=65536)
+    profile = {"state": "measured", "tools": False, "thinkingControl": "enable_thinking"}
+    calls = _patch_profile_status(monkeypatch, mode="enabled", status={"activeModelProfile": profile})
+
+    data = talk_client.get("/api/talk/status").json()
+
+    assert calls == [("GET", "/v1/model/status")]
+    assert data["modelCompatibility"]["hermesTalkAdvisory"] == {"code": "tools-unavailable"}
+    assert data["capabilities"]["text_chat"] is True
+    assert data["reason"] is None
+
+
+@pytest.mark.parametrize("mode, status", [
+    ("observe", {"activeModelProfile": {"state": "measured", "tools": False, "thinkingControl": None}}),
+    ("", {"activeModelProfile": {"state": "measured", "tools": False, "thinkingControl": None}}),
+    ("enabled", {"activeModelProfile": {"state": "measured", "tools": True, "thinkingControl": None}}),
+    ("enabled", {"status": "idle"}),
+])
+def test_talk_status_has_no_tools_advisory_otherwise(talk_client, monkeypatch, mode, status):
+    _patch_context_talk(monkeypatch, gguf="Qwen3.5-27B-Q4_K_M.gguf", env={"CTX_SIZE": "65536"},
+                        live_context=65536)
+    calls = _patch_profile_status(monkeypatch, mode=mode, status=status)
+
+    data = talk_client.get("/api/talk/status").json()
+
+    assert "hermesTalkAdvisory" not in data["modelCompatibility"]
+    assert data["capabilities"]["text_chat"] is True
+    # Observe and off never ask the host for a profile.
+    assert calls == ([] if mode != "enabled" else [("GET", "/v1/model/status")])
+
+
+def test_talk_status_survives_an_unreachable_host_agent(talk_client, monkeypatch):
+    from host_agent_client import AgentClientError
+
+    _patch_context_talk(monkeypatch, gguf="Qwen3.5-27B-Q4_K_M.gguf", env={"CTX_SIZE": "65536"},
+                        live_context=65536)
+    _patch_profile_status(monkeypatch, mode="enabled", status=AgentClientError("unreachable"))
+
+    data = talk_client.get("/api/talk/status").json()
+
+    assert "hermesTalkAdvisory" not in data["modelCompatibility"]
+    assert data["capabilities"]["text_chat"] is True

@@ -215,6 +215,25 @@ try {
     Check (@(Get-ChildItem -LiteralPath (Get-ODSPortalStateDir) -Directory | Where-Object { $_.Name -like 'portal-runtime.backup-*' }).Count -eq 0) 'a successful rerun leaves no backup behind'
     $script:owners = @{}
 
+    # --- Rerun: a selected vision model keeps its projector while it is stored --
+    Reset-Scenario
+    $projectorPath = Join-Path (Get-ODSPortalModelsDir) 'mmproj-Pick-F16.gguf'
+    [IO.File]::WriteAllText($projectorPath, 'fixture projector')
+    $selected = Get-Content -LiteralPath (Join-Path $runtimeDir 'runtime.json') -Raw | ConvertFrom-Json
+    $selected | Add-Member -NotePropertyName MmprojFile -NotePropertyValue 'mmproj-Pick-F16.gguf' -Force
+    Write-ODSPrivateEnvFile -Path (Join-Path $runtimeDir 'runtime.json') -Content ($selected | ConvertTo-Json -Compress)
+    $null = Initialize-ODSPortalAmdRuntime $plan $fixture $true 'Ubuntu-24.04' '/home/user/ods'
+    $kept = Get-Content -LiteralPath (Join-Path $runtimeDir 'runtime.json') -Raw | ConvertFrom-Json
+    $declared = Get-Content -LiteralPath (Join-Path $runtimeDir 'runtime-options.json') -Raw | ConvertFrom-Json
+    Check ($kept.GgufFile -ceq 'Dashboard-Pick.gguf' -and $kept.MmprojFile -ceq 'mmproj-Pick-F16.gguf' -and
+        (@($declared.PlanFeatures) -join ',') -ceq 'MmprojFile') 'a rerun keeps the selected vision projector, and the options declare that the launcher reads it'
+    Remove-Item -LiteralPath $projectorPath
+    Reset-Scenario
+    $null = Initialize-ODSPortalAmdRuntime $plan $fixture $true 'Ubuntu-24.04' '/home/user/ods'
+    $kept = Get-Content -LiteralPath (Join-Path $runtimeDir 'runtime.json') -Raw | ConvertFrom-Json
+    Check ($kept.GgufFile -ceq 'Dashboard-Pick.gguf' -and $null -eq $kept.MmprojFile) 'a projector no longer in the store is dropped and the model kept'
+    $script:owners = @{}
+
     # --- Rerun failure rolls back to the previous llama.cpp plan ----------------
     Reset-Scenario
     $before = @{}

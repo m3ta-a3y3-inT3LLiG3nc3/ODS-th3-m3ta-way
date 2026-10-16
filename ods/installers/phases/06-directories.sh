@@ -911,6 +911,8 @@ Fix with: sudo chown -R \$(id -u):\$(id -g) $INSTALL_DIR/config $INSTALL_DIR/dat
         printf -v "$_port_key" '%s' "$_port_value"
         export "$_port_key"
     done <<'SERVICE_PORT_DEFAULTS'
+DASHBOARD_PORT 3001
+DASHBOARD_REMOTE_PORT 3011
 WEBUI_PORT 3000
 PERPLEXICA_PORT 3004
 TTS_PORT 8880
@@ -1523,6 +1525,8 @@ ODS_VERSION=${VERSION:-3.0.0}
 # 127.0.0.1 = localhost only (secure default)
 # 0.0.0.0   = accessible from LAN (install with --lan or set manually)
 BIND_ADDRESS=$(dotenv_value "${BIND_ADDRESS}")
+DASHBOARD_PORT=${DASHBOARD_PORT_VALUE}
+DASHBOARD_REMOTE_PORT=${DASHBOARD_REMOTE_PORT_VALUE}
 # Lets the non-root remote-provider services read only lifecycle secrets that
 # the host agent writes mode 0640 under this installation owner's data group.
 REMOTE_PROVIDER_DATA_GID=$(id -g 2>/dev/null || echo 1000)
@@ -1822,6 +1826,7 @@ ENV_EOF
         ods_carry_extension_env_keys "$_phase06_previous_env" "$INSTALL_DIR/.env" \
             "$SCRIPT_DIR/extensions/services" "$INSTALL_DIR/data/user-extensions"
         ods_carry_public_url_env_keys "$_phase06_previous_env" "$INSTALL_DIR/.env"
+        ods_carry_named_env_keys "$_phase06_previous_env" "$INSTALL_DIR/.env" "${ODS_OWNER_ENV_KEYS[@]}"
         rm -f "$_phase06_previous_env"
     fi
     unset _phase06_previous_env

@@ -288,6 +288,19 @@ try {
     Check ((Get-Failure { $null = New-ODSNativeLlamaLaunchArguments $plan $options }) -match 'non-ASCII characters and no 8\.3 short name') 'a non-ASCII path without a short name stops with an explanation'
     $plan.ModelsDir = $modelsDir
 
+    # --- Vision projector (WP2): --mmproj from the same store, same name rule ---
+    Check (@(New-ODSNativeLlamaLaunchArguments $plan $options) -notcontains '--mmproj') 'a plan without a projector launches without --mmproj'
+    $plan | Add-Member -NotePropertyName MmprojFile -NotePropertyValue 'mmproj-F16.gguf'
+    $arguments = @(New-ODSNativeLlamaLaunchArguments $plan $options)
+    $at = [array]::IndexOf($arguments, '--mmproj')
+    Check ($at -gt 1 -and $arguments[$at + 1] -ceq (Join-Path $modelsDir 'mmproj-F16.gguf') -and
+        $arguments[1] -ceq (Join-Path $modelsDir $plan.GgufFile) -and $arguments[-2] -ceq '--reasoning') 'a planned projector loads with --mmproj beside the model, before the reasoning and tuning options'
+    foreach ($projector in @('../mmproj.gguf', ('mmproj-' + [char]0x00E9 + '.gguf'), '.gguf', 'mmproj.bin', ' mmproj.gguf', $plan.GgufFile.ToUpperInvariant())) {
+        $plan.MmprojFile = $projector
+        Check ((Get-Failure { $null = New-ODSNativeLlamaLaunchArguments $plan $options }) -match 'invalid vision projector') "projector name '$projector' is refused"
+    }
+    $plan.PSObject.Properties.Remove('MmprojFile')
+
     # --- Readiness proof: /health, /v1/models identity, /props path and n_ctx ---
     $script:http = @{}
     $script:httpKeys = [Collections.Generic.List[string]]::new()
@@ -330,6 +343,11 @@ try {
     $script:expectedKey = 'f' * 64
     Check ((Get-Failure { $null = Get-ODSNativeLlamaModelProof @proofArgs }) -match 'rejected the ODS API key') 'a wrong API key fails the proof visibly'
     $script:expectedKey = $key
+    Check ((Get-Failure { $null = Get-ODSNativeLlamaModelProof @proofArgs -Vision }) -match 'did not load the planned vision projector') 'a vision plan needs /props to report the vision modality'
+    $script:http['/props'] = [pscustomobject]@{ StatusCode = 200; Error = ''
+        Body = (@{ model_path = $modelPath; total_slots = 1; default_generation_settings = @{ n_ctx = 65536 }
+            modalities = @{ vision = $true; audio = $false } } | ConvertTo-Json -Depth 5) }
+    Check ((Get-ODSNativeLlamaModelProof @proofArgs -Vision).ContextVerified) 'a loaded projector (/props modalities.vision) verifies a vision plan'
 
     $script:healthSequence = [Collections.Generic.Queue[int]]::new()
     $script:http['/health'] = { [pscustomobject]@{ StatusCode = $script:healthSequence.Dequeue(); Body = ''; Error = '' } }
