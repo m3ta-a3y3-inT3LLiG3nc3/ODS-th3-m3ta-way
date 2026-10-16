@@ -44,7 +44,7 @@ Inspect real command exit status and relevant output. A missing case, early abor
 Preserve work across compaction/interruption. Recover requirements via pixel_ods_history and live operations via status tools. Historical prose is not current state. A failed lookup means unknown, not absent or failed installation. Reconcile uncertain write receipts before retrying.
 Report evidence limits: compilation, imports, HTTP readback and project behavior are distinct checks. State untested OS/GPU/model combinations; plans, submitted jobs and model narrative do not prove completion.
 ${PREVIEW_RUNTIME_CONTRACT}
-Test startup and pointer/keyboard controls at the exact published URL, including saving when storage is unavailable. Inspect browser errors and continued work after failed saves; HTTP 200 or a test outside the preview sandbox cannot establish this. Report unavailable verification. The inspector starts at the entry page with no navigation/reload; report cross-reload persistence unverified. Simulated reloads and sibling pages are not persistence evidence.`,
+Test startup and pointer/keyboard controls (inspector click/press, then assert results; assert-painted for canvas) at the exact published URL, including saving when storage is unavailable. Inspect browser errors and continued work after failed saves; HTTP 200 or a test outside the preview sandbox cannot establish this. Report unavailable verification. The inspector starts at the entry page with no navigation/reload; report cross-reload persistence unverified. Simulated reloads and sibling pages are not persistence evidence.`,
 });
 
 export function createAgentSkillTool() {

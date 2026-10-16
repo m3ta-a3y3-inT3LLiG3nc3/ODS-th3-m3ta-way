@@ -265,6 +265,8 @@ tests/test_pixel_source_upgrade_diagnostics.py
 tests/test_pixel_verify_lifecycle.py
 tests/test_portal_identity.py
 tests/test_preview_inspection_delayed_entrance.py
+tests/test_preview_inspection_paint.py
+tests/test_preview_inspection_press.py
 tests/test_remote_completion_telemetry.py
 tests/test_todo_fixes.py
 tests/test_validate_compose_stack_spaces.py

@@ -127,6 +127,76 @@ test('an artifact without room on the model store is not importable', async () =
   expect(dialog.getByRole('button', {name: 'Import', exact: true})).toBeEnabled()
 })
 
+test('explains why the native disk reserve blocks even a small artifact', async () => {
+  // Recorded native store: 37.32 GB free, but its required reserve is 51.13 GB.
+  detailsBody = {...detailsBody, artifacts: [{...artifacts[0], sizeBytes: 627000000}, artifacts[1]]}
+  preflightBody = preflight({
+    storage: {freeBytes: 37320003584, totalBytes: 1022580748288, marginBytes: 51129037414},
+    artifacts: {q4: {...okCheck, disk: 'insufficient'}, q8: {...okCheck, disk: 'insufficient'}},
+  })
+  const dialog = await open()
+  const storage = dialog.getByRole('region', {name: 'Model storage'})
+  expect(storage).toHaveTextContent('34.76 GiB available')
+  expect(storage).toHaveTextContent('ODS must keep 47.62 GiB free after the download')
+  expect(storage).toHaveTextContent('reopen this repository to check again')
+  expect(dialog.getAllByText(/ODS must keep/)).toHaveLength(1)
+  expect(dialog.getByText('Free 13.45 GiB more to download.')).toBeVisible()
+  for (const button of dialog.getAllByRole('button', {name: 'Not enough disk'})) expect(button).toBeDisabled()
+  expect(importBodies()).toEqual([])
+})
+
+test('the disk shortfall follows the vision choice without changing its import gate', async () => {
+  detailsBody = {
+    ...detailsBody,
+    projectors: [{id: 'p1', label: 'mmproj-F16.gguf', sizeBytes: 9e8}],
+    defaultProjectorId: 'p1',
+  }
+  preflightBody = preflight({
+    storage: {freeBytes: 6.4e9, marginBytes: 2e9},
+    artifacts: {
+      q4: {...okCheck, disk: 'insufficient', diskWithoutProjector: 'ok'},
+      q8: {...okCheck, disk: 'insufficient', diskWithoutProjector: 'insufficient'},
+    },
+  })
+  const dialog = await open()
+  expect(dialog.getByText('Free 476.84 MiB more to download.')).toBeVisible()
+  expect(dialog.getByText('Free 4.20 GiB more to download.')).toBeVisible()
+  expect(dialog.getAllByRole('button', {name: 'Not enough disk'})).toHaveLength(2)
+  await act(async () => { fireEvent.click(dialog.getByRole('checkbox', {name: /Include vision/})) })
+  expect(dialog.queryByText('Free 476.84 MiB more to download.')).toBeNull()
+  expect(dialog.queryByText('Free 4.20 GiB more to download.')).toBeNull()
+  expect(dialog.getByText('Free 3.36 GiB more to download.')).toBeVisible()
+  expect(dialog.getByRole('button', {name: 'Not enough disk'})).toBeDisabled()
+  await act(async () => { fireEvent.click(dialog.getByRole('button', {name: 'Import', exact: true})) })
+  expect(importBodies()).toEqual([{repoId: repo.id, revision: 'c'.repeat(40), artifactId: 'q4', includeVision: false}])
+})
+
+test.each([
+  null,
+  {freeBytes: null, marginBytes: 5e10},
+  {freeBytes: 1e11},
+  {freeBytes: '37320003584', marginBytes: 51129037414},
+  {freeBytes: 1e11, marginBytes: -1},
+])('unavailable disk data never invents a reserve or shortfall: %j', async storage => {
+  preflightBody = preflight({storage, artifacts: {q4: {...okCheck, disk: 'insufficient'}, q8: okCheck}})
+  const dialog = await open()
+  expect(dialog.getByRole('region', {name: 'Model storage'})).toHaveTextContent('Disk space details are unavailable')
+  expect(dialog.queryByText(/ODS must keep/)).toBeNull()
+  expect(dialog.queryByText(/^Free .* more to download/)).toBeNull()
+  expect(dialog.getByRole('button', {name: 'Not enough disk'})).toBeDisabled()
+  expect(dialog.getByRole('button', {name: 'Import', exact: true})).toBeEnabled()
+  expect(importBodies()).toEqual([])
+})
+
+test('a measured zero reserve is shown without inventing the host minimum', async () => {
+  preflightBody = preflight({storage: {freeBytes: 1e11, marginBytes: 0}})
+  const dialog = await open()
+  const storage = dialog.getByRole('region', {name: 'Model storage'})
+  expect(storage).toHaveTextContent('ODS must keep 0 bytes free after the download')
+  expect(storage).not.toHaveTextContent('Free up space')
+  for (const button of dialog.getAllByRole('button', {name: 'Import', exact: true})) expect(button).toBeEnabled()
+})
+
 test('a failed repository check leaves an artifact-specific check available', async () => {
   preflightBody = {status: 'idle'}
   const dialog = await open()

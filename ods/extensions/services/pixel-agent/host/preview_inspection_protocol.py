@@ -26,17 +26,40 @@ CSP = (
 )
 SANDBOX = "allow-scripts allow-forms allow-downloads"
 SCOPE = "Only the listed CSS layout visibility, normalized visible-text assertions and click dispatches were tested; not pixel paint, occlusion, clipping, a full accessibility audit, or overall functionality."
-SELECT_SCOPE = SCOPE + " Native single-select values were observed only for explicit select-option steps."
+SELECT_OPTION_SCOPE = " Native single-select values were observed only for explicit select-option steps."
+SELECT_SCOPE = SCOPE + SELECT_OPTION_SCOPE
 SELECT_CAPABILITY = "native-single-select-v1"
 FILL_CAPABILITY = "native-text-number-fill-v2"
 FILL_SCOPE = " Native non-sensitive text and number fields were filled only with explicit synthetic values; number constraint flags are observations, not a claim of form validity. This does not test keyboard behavior or submit forms."
 DOWNLOAD_CAPABILITY = "snapshot-download-v1"
 DOWNLOAD_SCOPE = " Download verification is limited to one final step whose own click must produce matching snapshot bytes inside the capsule. A failed or unavailable receipt does not verify a download; no delivery to the user's computer, PDF quality, or ZIP content validation is established."
+PRESS_CAPABILITY = "trusted-key-press-v1"
+PRESS_SCOPE = " Trusted key presses were sent to the focused preview frame only for explicit press steps; behavior beyond the listed assertions, such as gameplay, is not verified."
+# One unmodified key per press: no modifiers, chords, function keys or text.
+# workspace-preview-inspect.mjs mirrors this list exactly as a schema enum.
+PRESS_KEYS = (
+    "ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight", "Space", "Enter", "Escape", "Tab",
+    *"abcdefghijklmnopqrstuvwxyz", *"0123456789",
+)
+PRESS_HOLD_MS = 100
+MAX_PRESS_HOLD_MS = 1000
+PAINT_CAPABILITY = "element-paint-v1"
+PAINT_SCOPE = " Pixel paint was checked only for explicit assert-painted steps, as aggregate color statistics of each element's on-screen box; this detects a blank or single-color render, not image recognition or whether the intended content was drawn."
+# Press and paint plans run only on a capsule labelled for them, so their scope
+# need not match older capsules: its base does not deny the key presses and
+# paint checks described after it, and beside presses the fill sentence speaks
+# only of fill. workspace-preview-inspect.mjs mirrors both exactly.
+STEP_SCOPE = "Only the listed steps were tested, each only as stated here. CSS layout visibility, normalized visible-text assertions and click dispatches do not test pixel paint; no step tests occlusion, clipping, a full accessibility audit, or overall functionality."
+PRESS_FILL_SCOPE = " Native non-sensitive text and number fields were filled only with explicit synthetic values; number constraint flags are observations, not a claim of form validity. Fill sends no key events and does not submit forms."
 
 
 def inspection_scope(request):
-    scope = SELECT_SCOPE if any(s['action'] == 'select-option' for s in request['steps']) else SCOPE
-    scope += FILL_SCOPE if any(s['action'] == 'fill' for s in request['steps']) else ''
+    pressed = any(s['action'] == 'press' for s in request['steps'])
+    scope = STEP_SCOPE if pressed or any(s['action'] == 'assert-painted' for s in request['steps']) else SCOPE
+    scope += SELECT_OPTION_SCOPE if any(s['action'] == 'select-option' for s in request['steps']) else ''
+    scope += (PRESS_FILL_SCOPE if pressed else FILL_SCOPE) if any(s['action'] == 'fill' for s in request['steps']) else ''
+    scope += PRESS_SCOPE if pressed else ''
+    scope += PAINT_SCOPE if any(s['action'] == 'assert-painted' for s in request['steps']) else ''
     return scope + (DOWNLOAD_SCOPE if request['steps'][-1]['action'] == 'download' else '')
 
 
@@ -187,10 +210,16 @@ def validate_request(value):
         text_step = isinstance(step, dict) and step.get("action") == "assert-text"
         select_step = isinstance(step, dict) and step.get("action") in ("select-option", "fill")
         download_step = isinstance(step, dict) and step.get("action") == "download"
-        extra = ("expectedText",) if text_step else ("value",) if select_step else ("path", "expectedBytes", "expectedSha256") if download_step else ()
+        press_step = isinstance(step, dict) and step.get("action") == "press"
+        extra = ("expectedText",) if text_step else ("value",) if select_step else ("path", "expectedBytes", "expectedSha256") if download_step else ("key", *(("holdMs",) if "holdMs" in step else ())) if press_step else ()
         exact(step, ("action", "locator", *extra))
-        if step["action"] not in ("assert-visible", "assert-hidden", "assert-text", "click", "select-option", "fill", "download"):
+        if step["action"] not in ("assert-visible", "assert-hidden", "assert-text", "click", "select-option", "fill", "download", "press", "assert-painted"):
             raise Invalid("invalid step")
+        if press_step and (
+            not isinstance(step["key"], str) or step["key"] not in PRESS_KEYS
+            or ("holdMs" in step and (type(step["holdMs"]) is not int or not 0 <= step["holdMs"] <= MAX_PRESS_HOLD_MS))
+        ):
+            raise Invalid("invalid press step")
         if download_step and (
             index != len(steps) - 1 or not isinstance(step['path'], str)
             or len(step['path']) > 512 or len(step['path'].split('/')) > 12

@@ -5612,6 +5612,111 @@ export function userMessageExactHostCommand(messages, prompt = undefined) {
   return exact?.[1];
 }
 
+// An action word asks for a host command only when it is used as a verb aimed
+// at the host. In "the start screen", "every restart", "the game's restart",
+// "a hard reload" or "press start" it names part of the owner's project or a
+// moment in it. In "the game won't start", "it used to run", "the sprites
+// start flickering", "restart doesn't work" or "when I restart the level" it
+// describes what something did or what the owner did. In "change the layout
+// so it fits on my laptop" the project is the object and the laptop is only
+// where the owner looked.
+const HOST_ACTION_WORD =
+  /\b(?:run|execute|invoke|launch|start|stop|restart|reload|install|uninstall|remove|update|upgrade|configure|modify|change|create|delete)\b/gi;
+const NOUN_ADJECTIVE =
+  String.raw`(?:latest|last|new|recent|first|next|second|third|final|fresh|clean|hard|soft|cold|warm|full|quick|test|trial|manual|pending|previous|initial|failed|partial)`;
+const NOT_A_REQUEST_BEFORE_HOST_ACTION = new RegExp(String.raw`(?:${[
+  // A noun phrase. "Apply the latest update" and "needs a restart" make the
+  // noun the object of a request, and in "make this run" "this" is an object.
+  String.raw`\b(?<!\b(?:apply|do|perform|finish|complete|redo|retry|rerun|resume|continue|handle|trigger|schedule|kick\s+off|go\s+ahead\s+with|take\s+care\s+of|need(?:s|ed)?|give\s+[\w.-]+)\s+)(?:the|a|an|these|those|my|your|our|its|their|every|each|no|any|some|(?<!\b(?:make|let|get|have)\s+)(?:this|that))(?:\s+${NOUN_ADJECTIVE})?`,
+  // A possessive ("yesterday's update"), but not "let's" or "it's".
+  String.raw`\b(?!(?:let|it|that|what|here|there|who|where|he|she|how)['’]s\b)[\w-]+['’]s`,
+  // A moment or a press: "at start", "on first launch", "clicking restart".
+  String.raw`\b(?:at|on|after|upon)(?:\s+${NOUN_ADJECTIVE})?`,
+  String.raw`\b(?:press(?:es|ed|ing)?|click(?:s|ed|ing)?|hit(?:s|ting)?|tap(?:s|ped|ping)?|select(?:s|ed|ing)?|choos(?:e|es|ing)|chose)`,
+  // What something does or did: "won't even start", "used to run", "should run".
+  String.raw`\b(?:not|won['’]?t|doesn['’]?t|didn['’]?t|wouldn['’]?t|isn['’]?t|can['’]?t|cannot|couldn['’]?t)(?:\s+(?:even|ever|really|always|properly|actually|correctly|reliably|fully|quite|seem\s+to))*`,
+  String.raw`\b(?:fail(?:s|ed)?|refuse[sd]?|struggle[sd]?|seem(?:s|ed)?|used|tend(?:s|ed)?)\s+to`,
+  String.raw`\b(?:takes?|took)\s+(?:[\w-]+\s+){0,3}to`,
+  String.raw`\bno\s+(?:way|option)\s+to`,
+  String.raw`\blet\s+me`,
+  String.raw`\b(?:makes|made|making|forces|forced|forcing|causes|caused|causing)\s+(?:me|us|you|it|(?:my|this|the)\s+(?:ODS\s+)?(?:host|machine|computer|laptop))(?:\s+to)?`,
+  String.raw`(?<!\b(?:you|we|Pixel)\s+)\b(?:will|would|should|could|might|may|must|can|shall)(?:\s+(?:not|never|barely|hardly|still|also|only|always|sometimes|eventually|automatically|really|even|just))*`,
+  // What the owner did: "I restart", "when we restart", "whenever you
+  // restart", "I've tried to start". "Can we stop Ollama" stays a request.
+  String.raw`\bI`,
+  String.raw`\b(?:when|whenever|if|after|before|until|once|while|every\s+time|each\s+time)\s+(?:I|we|they)(?:\s+(?:just|first|then|also|again))?`,
+  String.raw`\b(?:when|whenever|until|every\s+time|each\s+time)\s+you`,
+  String.raw`(?:\b(?:I|we)(?:['’]ve|\s+(?:have|had|was|were|am|are|just|already|also|even|then|still))*\s+(?:tried|try|trying|attempted|had|have)|\b(?:tried|trying))\s+to`,
+].join('|')})\s+["'“‘]?$`, 'i');
+// "I can't restart Docker" asks Pixel to do what the owner could not, but "I
+// can't restart the level" is a bug report. It is a request only when the
+// clause names host software or asks for the work.
+const OWNER_CANNOT_BEFORE_HOST_ACTION =
+  /\b(?:I|we)(?:\s+(?:still|just|really|simply|honestly|actually|even|literally|also))*\s+(?:can['’]?t|cannot|can\s+not|couldn['’]?t)\s+$/i;
+// "start flickering", "stop responding", "start to lag" describe what a
+// thing does, unless the word opens a request ("Stop running containers").
+const ASPECT_AFTER_START_STOP = /^\s+(?:to\s+\w|(?!(?:every|any|some|no)thing\b)\w+ing\b)/i;
+const IMPERATIVE_BEFORE_HOST_ACTION =
+  /(?:^|[,:]|\b(?:please|kindly|then|now|just|also|first|and|you|to))\s*$/i;
+// A finite verb after the word makes it a subject: "Restart doesn't work",
+// "Cold start takes 10 seconds", "First launch on my laptop shows a blank page".
+const SUBJECT_USE_AFTER_HOST_ACTION = new RegExp(String.raw`^(?:\s+(?:and|or|&)\s+${HOST_ACTION_WORD.source})?\s+(?:(?:on|in)\s+(?:this|my|the)\s+(?:ODS\s+)?(?:host|machine|computer|laptop)\s+)?(?:(?:still|also|just|never|always|now|even|sometimes)\s+)?(?:is|isn['’]?t|was|wasn['’]?t|are|aren['’]?t|were|does|doesn['’]?t|did|didn['’]?t|won['’]?t|can['’]?t|has|hasn['’]?t|had|keeps?|takes?|took|shows?|showed|crashe[sd]|freezes|froze|hangs|hung|fails|failed|breaks|broke|overlaps?|resets|seems|looks|gets|got|works|worked|stalls|stalled|when|whenever|while|by\s+itself|itself)\b`, 'i');
+// A UI noun right after the word ("start screen", "start/restart buttons",
+// "upgrade shop", a quoted "Start" button, "change log") makes it part of a
+// name. A host setting after "screen" ("change screen resolution") and "logs",
+// "log files" or "log cleanup" are the object of a request.
+const NOUN_AFTER_HOST_ACTION = new RegExp(String.raw`^(?:\s*(?:and|or|&|\/)\s*${HOST_ACTION_WORD.source})?[\s"'“”‘’-]+(?:(?:screen|menu|button|page|link|icon|bar|panel|tab|dialog|banner|view|option|text|prompt|title|logo|label|popup|modal|overlay|animation|speed|position|shop|note)s?\b(?!\s+(?:settings?|resolution|recording|timeout|saver|brightness|scaling|sharing|capture|lock)\b)|log\b(?=\s*(?:$|[,:!?)]|(?:on|in|is|was|does|doesn['’]?t|shows?|says?|looks?)\b)))`, 'i');
+// The project as subject ("make the game run better", "the game won't start",
+// even after "please fix it") or as the object ending the phrase after the
+// word ("change the start screen so it fits", "stop the elf from clipping").
+const PROJECT_SUBJECT_BEFORE_HOST_ACTION =
+  /\b(?:the|this|that|my|our|your|its)\s+(?:[\w-]+\s+)?(?:game|level|elf|sprite|player|enemy|enemies|character)s?\s+(?:(?:will|would|should|can|could|does|did|won['’]?t|wouldn['’]?t|doesn['’]?t|didn['’]?t|can['’]?t|cannot|isn['’]?t)\s+(?:(?:not|even|ever|really)\s+)*)?$/i;
+const PROJECT_OBJECT_AFTER_HOST_ACTION =
+  /^\s+(?:(?:the|this|that|these|those|a|an|my|our|your|its)\s+)?(?:[\w'’-]+\s+){0,2}?(?:game|level|layout|font(?:\s+size)?|scrollbar|elf|sprite|player|enemy|enemies|score|hud|title|screen|menu|button|page|icon|banner|dialog|popup|overlay|animation|text|label|logo)s?\b(?=\s*(?:$|[,:!?)]|(?:so|that|which|it|on|in|for|from|to|at|when|while|and|but|with|by|is|are|because|until|whenever)\b))/i;
+// Describing a host problem and then asking for help is still a host request:
+// "Docker won't start on my laptop, can you fix it?", "The last update broke
+// Ollama on my machine. Can you roll it back?". A hand-off of the work itself
+// ("please do it", "redo it", "can you?") counts without naming host software.
+const HOST_SOFTWARE =
+  /\b(?:docker|ollama|ODS(?![- ]host\b)(?!\s+(?:link|button|logo|page|site|website|icon|banner|text|title)\b)|llama[-.]?(?:server|cpp)|vllm|cuda|nvidia|drivers?|containers?|services?|daemons?|wsl|packages?|htop|model\s+files)\b/i;
+const HOST_HELP_REQUEST =
+  /\b(?:(?:can|could|would|will)\s+you|please|go\s+ahead|for\s+me|help|I\s+need\s+you\s+to|(?:fix|repair|reinstall|undo|revert|handle|force)\s+(?:it|that|this)|(?:roll|sort)\s+(?:it|that|this)\s+(?:back|out)|try\s+(?:it\s+)?again|take\s+a\s+look)\b/i;
+const HOST_HANDOFF =
+  /\b(?:(?:do|redo|finish|complete|resume|retry|rerun|apply)\s+(?:it|that|this)\b|you\s+do\s+it\b|(?:can|could|would|will)\s+you\s*$)/i;
+
+function actionUnrelatedToHost(clause, match, hostIndex) {
+  if (match.index > hostIndex) return false;
+  const relation = clause.slice(match.index + match[0].length, hostIndex);
+  return Boolean(relation.trim()) && !/\b(?:on|in|from|against|for)\b/i.test(relation);
+}
+
+function hostActionIsVerb(clause, match, {requested, hostSoftware}) {
+  const before = clause.slice(0, match.index);
+  const after = clause.slice(match.index + match[0].length);
+  if (NOUN_AFTER_HOST_ACTION.test(after)) return false;
+  if (PROJECT_SUBJECT_BEFORE_HOST_ACTION.test(before) || PROJECT_OBJECT_AFTER_HOST_ACTION.test(after)) {
+    return false;
+  }
+  if (requested) return true;
+  if (OWNER_CANNOT_BEFORE_HOST_ACTION.test(before)) return hostSoftware;
+  if (/^(?:start|stop)$/i.test(match[0]) && ASPECT_AFTER_START_STOP.test(after) &&
+      !IMPERATIVE_BEFORE_HOST_ACTION.test(before)) {
+    return false;
+  }
+  return !NOT_A_REQUEST_BEFORE_HOST_ACTION.test(before) && !SUBJECT_USE_AFTER_HOST_ACTION.test(after);
+}
+
+function hostActionVerb(clause, hostIndex, context) {
+  for (const match of clause.matchAll(HOST_ACTION_WORD)) {
+    if (hostActionIsVerb(clause, match, context)) return match;
+    // A skipped noun with the host as the object of another verb ("The start
+    // screen froze my laptop") means a later action word in the same clause
+    // describes the aftermath ("and I had to restart").
+    if (!context.requested && actionUnrelatedToHost(clause, match, hostIndex)) return undefined;
+  }
+  return undefined;
+}
+
 export function userMessageRequestsHostCommand(messages, prompt = undefined) {
   const text = currentOwnerIntentText(messages, prompt);
   if (!text) return false;
@@ -5625,7 +5730,6 @@ export function userMessageRequestsHostCommand(messages, prompt = undefined) {
   }
   if (userMessageExactHostCommand(messages, prompt)) return true;
   const localHost = /\b(?:ODS[- ]host|local\s+(?:ODS\s+)?host|this\s+(?:ODS\s+)?(?:host|machine|computer|laptop)|my\s+(?:ODS\s+)?(?:host|machine|computer|laptop))\b/i;
-  const action = /\b(?:run|execute|invoke|launch|start|stop|restart|reload|install|uninstall|remove|update|upgrade|configure|modify|change|create|delete)\b/i;
   const remoteHost = /\b(?:SSH\s+(?:(?:connection|connectivity)\s+)?(?:to|into)|remote\s+(?:host|machine|computer|server|device)|(?:host|machine|computer|server|device)\s+(?:named|called)\s+[A-Za-z0-9][A-Za-z0-9._-]{0,127})\b/i;
   const remoteAction = /\b(?:connect|verify|check|inspect|query|report|troubleshoot|debug|run|execute|invoke)\b/i;
   const guidanceOnly =
@@ -5638,7 +5742,7 @@ export function userMessageRequestsHostCommand(messages, prompt = undefined) {
     /\b(?:do\s+not|don't|never|must\s+not|should\s+not)\s+(?:ever\s+|actually\s+|please\s+|now\s+){0,2}(?:SSH|connect|contact|access|inspect|query|run|execute|invoke)\b/i;
   return text
     .split(/[.!?;\n]+|,\s*(?=(?:and\s+then|but|however|instead|then)\b)/i)
-    .some((clause) => {
+    .some((clause, index, clauses) => {
       const remoteHostMatch = clause.match(remoteHost);
       const remoteActionMatch = clause.match(remoteAction);
       if (remoteHostMatch && remoteActionMatch) {
@@ -5650,8 +5754,15 @@ export function userMessageRequestsHostCommand(messages, prompt = undefined) {
         );
       }
       const hostMatch = clause.match(localHost);
-      const actionMatch = clause.match(action);
-      if (!hostMatch || !actionMatch) return false;
+      if (!hostMatch) return false;
+      // A request for help may follow in the next sentence: "The last update
+      // broke Ollama on my machine. Can you roll it back?"
+      const next = clauses[index + 1] || '';
+      const hostSoftware = HOST_SOFTWARE.test(clause);
+      const requested = HOST_HANDOFF.test(clause) || HOST_HANDOFF.test(next) ||
+        (hostSoftware && (HOST_HELP_REQUEST.test(clause) || HOST_HELP_REQUEST.test(next)));
+      const actionMatch = hostActionVerb(clause, hostMatch.index, {requested, hostSoftware});
+      if (!actionMatch) return false;
       // Negation and how-to language constrain only their own clause. A later
       // safety boundary such as "Do not run anything else" must not erase an
       // earlier exact host command that the owner explicitly requested.
@@ -5665,15 +5776,7 @@ export function userMessageRequestsHostCommand(messages, prompt = undefined) {
       ) {
         return false;
       }
-      if (actionMatch.index < hostMatch.index) {
-        const relation = clause.slice(
-          actionMatch.index + actionMatch[0].length,
-          hostMatch.index
-        );
-        if (relation.trim() && !/\b(?:on|in|from|against|for)\b/i.test(relation)) {
-          return false;
-        }
-      }
+      if (actionUnrelatedToHost(clause, actionMatch, hostMatch.index)) return false;
       return !/\brun\s+(?:a|any|some|the)?\s*(?:command|shell)\s*(?:on|against|for)?\s*(?:this|my|the|ODS)?\s*(?:host|machine|computer|laptop)?\s*$/i.test(
         clause.trim()
       );

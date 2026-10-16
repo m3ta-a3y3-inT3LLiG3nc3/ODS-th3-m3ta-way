@@ -630,6 +630,14 @@ function ArtifactDialog({ model, details, loading, error, preflight, preflightLo
                 </div>
               )}
 
+              {preflight && details.runtimeCompatible !== false && details.artifacts.length > 0 && (
+                <StorageSummary storage={preflight.storage} blocked={details.artifacts.some(artifact => (
+                  !artifact.installed && (projector && !includeVision
+                    ? preflight.artifacts?.[artifact.id]?.diskWithoutProjector
+                    : preflight.artifacts?.[artifact.id]?.disk) === 'insufficient'
+                ))} />
+              )}
+
               {details.artifacts.length === 0 ? (
                 <div className="rounded-lg border border-theme-border bg-theme-text-secondary/8 px-4 py-8 text-center text-sm text-theme-text-secondary">
                   This repository has no complete GGUF artifact with exact size and SHA-256 metadata.
@@ -662,6 +670,8 @@ function ArtifactDialog({ model, details, loading, error, preflight, preflightLo
                         artifact={artifact}
                         gpu={gpu}
                         check={preflight?.artifacts?.[artifact.id] || null}
+                        storage={preflight?.storage}
+                        projectorBytes={projector && includeVision ? projector.sizeBytes : 0}
                         projectorSkipped={Boolean(projector) && !includeVision}
                         checking={preflightLoading}
                         checkingHeader={checkingArtifact === artifact.id}
@@ -691,7 +701,7 @@ function ArtifactDialog({ model, details, loading, error, preflight, preflightLo
   )
 }
 
-function ArtifactRow({ artifact, gpu, check, projectorSkipped, checking, checkingHeader, checkIssue, refusal: artifactRefusal, busy, importing, runtimeCompatible, onImport }) {
+function ArtifactRow({ artifact, gpu, check, storage, projectorBytes, projectorSkipped, checking, checkingHeader, checkIssue, refusal: artifactRefusal, busy, importing, runtimeCompatible, onImport }) {
   const artifactPath = artifact.files?.[0]?.filename || artifact.label
   const refusal = artifactRefusal || check?.tensors?.refusal || null
   const [confirmingOverride, setConfirmingOverride] = useState(false)
@@ -699,6 +709,8 @@ function ArtifactRow({ artifact, gpu, check, projectorSkipped, checking, checkin
   // check.disk counts the default projector; with Include vision unticked only the weights download.
   const disk = projectorSkipped ? check?.diskWithoutProjector : check?.disk
   const diskShort = disk === 'insufficient' && !artifact.installed
+  const shortfall = knownStorage(storage) && diskBytes(artifact.sizeBytes) && diskBytes(projectorBytes)
+    ? artifact.sizeBytes + projectorBytes + storage.marginBytes - storage.freeBytes : null
   const blocked = !runtimeCompatible || (refusal && !refusal.overridable)
   const needsOverride = Boolean(refusal?.overridable) && !blocked
   // Import records survive deletion; their IDs identify artifacts, not a failed action.
@@ -728,7 +740,9 @@ function ArtifactRow({ artifact, gpu, check, projectorSkipped, checking, checkin
       <div>
         <p className={`text-xs font-semibold ${memory.ok === false ? 'text-theme-text-secondary' : 'text-emerald-300'}`}>{memory.value}</p>
         <p className="mt-0.5 text-[10px] text-theme-text-muted">{memory.detail}</p>
-        {diskShort && <p className="mt-0.5 text-[10px] font-semibold text-amber-300">Not enough free disk space</p>}
+        {diskShort && <p className="mt-0.5 text-[10px] font-semibold text-amber-300">{shortfall > 0
+          ? `Free ${formatDiskBytes(shortfall, true)} more to download.`
+          : 'Not enough free disk space'}</p>}
         {check?.tensors?.status === 'unsupported' && (
           <p className="mt-0.5 text-[10px] font-semibold text-amber-300">Stored as {check.tensors.unknown.join(', ')}: needs a newer llama.cpp</p>
         )}
@@ -759,6 +773,33 @@ function ArtifactRow({ artifact, gpu, check, projectorSkipped, checking, checkin
         </div>
       )}
     </div>
+  )
+}
+
+function diskBytes(value) {
+  return Number.isSafeInteger(value) && value >= 0
+}
+
+function knownStorage(storage) {
+  return diskBytes(storage?.freeBytes) && diskBytes(storage?.marginBytes)
+}
+
+function formatDiskBytes(bytes, roundUp = false) {
+  if (bytes === 0) return '0 bytes'
+  const unit = bytes >= 1024 ** 3 ? 1024 ** 3 : bytes >= 1024 ** 2 ? 1024 ** 2 : 1
+  const label = unit === 1024 ** 3 ? 'GiB' : unit === 1024 ** 2 ? 'MiB' : 'bytes'
+  const value = roundUp ? Math.ceil(bytes / unit * 100) / 100 : bytes / unit
+  return `${value.toFixed(unit === 1 ? 0 : 2)} ${label}`
+}
+
+function StorageSummary({ storage, blocked }) {
+  return (
+    <section aria-label="Model storage" className="mb-4 space-y-1 rounded-lg border border-white/[0.07] bg-black/20 px-4 py-3 text-xs text-theme-text-secondary">
+      {knownStorage(storage) ? <>
+        <p>Disk space: {formatDiskBytes(storage.freeBytes)} available. ODS must keep {formatDiskBytes(storage.marginBytes)} free after the download.</p>
+        {blocked && <p>Free up space on the model drive, then reopen this repository to check again.</p>}
+      </> : <p>Disk space details are unavailable. ODS will check space before downloading.</p>}
+    </section>
   )
 }
 
