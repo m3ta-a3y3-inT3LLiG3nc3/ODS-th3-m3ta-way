@@ -412,7 +412,9 @@ export default definePluginEntry({
       const workspaceRoot = api.config?.agents?.list?.find(agent => agent.id === AGENT_ID)?.workspace
         ?? api.config?.agents?.defaults?.workspace;
       const executionHost = executionHostForAgent(api.config, AGENT_ID);
-      toolLoopGuard.observeRun(context, AGENT_ID, event, { privateBrowserAccess, workspaceRoot, executionHost });
+      // The run deadline the runtime just armed for this attempt.
+      const runTimeoutSeconds = (api.runtime?.config?.current?.() ?? api.config)?.agents?.defaults?.timeoutSeconds;
+      toolLoopGuard.observeRun(context, AGENT_ID, event, { privateBrowserAccess, workspaceRoot, executionHost, runTimeoutSeconds });
       if (!accessRuntime.isProbe(context)) delegationDelivery.observe(event,context);
       const ownerEvent = toolLoopGuard.ownerIntentEventForRun(context?.runId ?? event?.runId, event);
       if (!accessRuntime.isProbe(context)) { goalProgress.begin(ownerEvent, context); taskActivity.begin(ownerEvent, {...context,workspaceRoot}); }

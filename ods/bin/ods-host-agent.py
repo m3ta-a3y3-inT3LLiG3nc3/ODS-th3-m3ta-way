@@ -20887,9 +20887,14 @@ def _reconcile_native_pixel_startup():
                          and projection.get('busy') is False
                          and projection.get('reason') in (
                              'admission-gate-unavailable', 'runtime-unavailable-or-busy',
-                             'managed-runtime-unavailable')))
+                             'managed-runtime-unavailable',
+                             # Boot order: after a WSL or machine restart this check can
+                             # run before Docker or the Pixel edge container is up.
+                             'edge-container-unavailable', 'host-command-failed')))
                 if not retry:
-                    logger.warning('Pixel startup reproof requires attention')
+                    # Both values are bounded tokens from the helper's projection.
+                    logger.warning('Pixel startup reproof requires attention (stage=%s reason=%s)',
+                                   diagnostic.get('stage'), projection.get('reason'))
                     return
                 unavailable = (diagnostic.get('stage'), projection.get('reason'))
             except (OSError, ValueError, TypeError, AttributeError, subprocess.TimeoutExpired):

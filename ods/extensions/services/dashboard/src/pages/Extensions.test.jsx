@@ -931,3 +931,26 @@ it('opens enabled Hermes through its ODS authenticated proxy entry', async () =>
   expect(within(agentCard).getByRole('link',{name:':9120'})).toHaveAttribute(
     'href','http://localhost:9120/auth/ods')
 })
+
+it('re-checks the ODS session before opening Hermes from its card', async () => {
+  const fetchMock = installFetchMock({agent_available:true,extensions:[
+    {id:'hermes',name:'Hermes Agent',source:'core',status:'enabled',
+      library_manageable:true,library_selected:true,external_port_default:0,features:[baseFeature]},
+    {id:'hermes-proxy',name:'Hermes Auth Proxy',source:'core',status:'enabled',
+      library_manageable:true,library_selected:true,external_port:9120,ui_path:'/auth/ods',features:[baseFeature]},
+  ],summary:baseSummary({total:2,installed:2})})
+  const catalog = fetchMock.getMockImplementation()
+  fetchMock.mockImplementation(async (url, options) => {
+    if (url === '/api/auth/verify-session') return makeJsonResponse({}, {ok:false, status:401})
+    if (url === '/api/auth/admin-session') return makeJsonResponse({ok:true})
+    return catalog(url, options)
+  })
+  const tab = {opener:window, closed:false, location:{replace:vi.fn()}}
+  vi.spyOn(window, 'open').mockReturnValue(tab)
+  render(<Extensions compact />)
+  const agentCard = (await screen.findByRole('heading',{name:'Hermes Agent'})).closest('article')
+  expect(fireEvent.click(within(agentCard).getByRole('link',{name:':9120'}))).toBe(false)
+  expect(window.open).toHaveBeenCalledWith('', '_blank')
+  await waitFor(() => expect(tab.location.replace).toHaveBeenCalledWith('http://localhost:9120/auth/ods'))
+  expect(fetchMock).toHaveBeenCalledWith('/api/auth/admin-session', expect.objectContaining({method:'POST'}))
+})

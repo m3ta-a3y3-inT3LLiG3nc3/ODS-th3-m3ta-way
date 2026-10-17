@@ -11,7 +11,7 @@ import {validDeliveredArtifact, normalizeWorkspaceArtifact, WORKSPACE_ARTIFACT_D
 // OpenClaw's public harness runtime.
 
 import { createHash, randomBytes } from "node:crypto";
-import { validSourceReview, normalizeWorkspacePreviewParams, PREVIEW_STORAGE_DISCLOSURE } from './workspace-preview.mjs';
+import { validSourceReview, normalizeWorkspacePreviewParams } from './workspace-preview.mjs';
 import * as fs from "node:fs";
 import { homedir } from "node:os";
 import path from "node:path";
@@ -33,6 +33,7 @@ import { createRunProgressBudget, failedToolOutcome, isLiteralEcho, lookupFoundN
 import { assistantMessageText, composeProgressFinalization, composeReadPages, createProgressFinalization, partialFinalizationAnswer,
   PROGRESS_FINALIZATION_INSTRUCTION } from "./progress-finalization.mjs";
 import { STOP_SYNTHESIS_LIMITS, STOP_SYNTHESIS_NOTE, synthesisAnswer, synthesisRequest } from "./stop-synthesis.mjs";
+import { createRunDeadline, runDeadlineReached, runDeadlineStopText, takeRunDeadlineNotice } from "./run-deadline.mjs";
 import { OWNER_VISIBLE_REPLY_INSTRUCTION, OWNER_VISIBLE_REPLY_REASON, ownerInteractiveTurn, silentReplyText } from "./owner-visible-reply.mjs";
 import { canonicalWorkspaceParams, extensionlessHtmlWrite, workspaceFileParent, nativeExecWorkdir, sandboxHostWorkspaceFailure, malformedRelativeWorkspacePath } from "./workspace-path-contract.mjs";
 import { routePlaygroundTool, requestsNewPlaygroundProject } from "./playground-projects.mjs";
@@ -7172,7 +7173,7 @@ function execTargetsNonPublicAddress(event) {
 }
 
 export function createToolLoopGuard({
-  abortRun,
+  abortRun: abortActiveRun,
   abortRunAndDrain,
   cancelProjectRun,
   execControl,
@@ -7187,6 +7188,7 @@ export function createToolLoopGuard({
   limits,
   warn = () => {},
   info = () => {},
+  now = Date.now,
 } = {}) {
   const effective = normalizedLimits(limits);
   // This intentionally stays plugin-local. OpenClaw's runContext write API is
@@ -7195,6 +7197,14 @@ export function createToolLoopGuard({
   const runs = new Map();
   const activeUsers = new Map();
   const sessionRuns = new Map();
+  // Every run the guard itself stops is marked, so agent_end never names the
+  // runtime's run deadline as the cause (observeAgentEnd).
+  const abortRun = typeof abortActiveRun === "function" ? (sessionId, ...rest) => {
+    const state = runs.get(sessionRuns.get(sessionId));
+    const aborted = abortActiveRun(sessionId, ...rest);
+    if (aborted && state) state.odsAborted = true;
+    return aborted;
+  } : undefined;
   // The newest run observed per session key, and the owner cancel that the
   // next owner message in that chat must start clean from.
   const sessionKeyRuns = new Map();
@@ -7574,6 +7584,7 @@ export function createToolLoopGuard({
         privateNetworkRequestDenied: false,
         privateNetworkPrompt: false,
         clientCancelled: false,
+        odsAborted: false,
         fetchedUrls: new Map(),
         // Research pacing (research-pacing.mjs). Run state, so it survives
         // transcript compaction: bound search receipts with their result
@@ -7644,6 +7655,8 @@ export function createToolLoopGuard({
         ownerIntentObserved: false,
         workspaceTaskRequested: false,
         workspaceMutationRequested: false,
+        // A successful write, edit or exec (an exec can change files too).
+        workspaceMutationObserved: false,
         workspaceTaskPath: undefined,
         workspaceTaskDirectory: undefined,
         workspaceRequestedFiles: [],
@@ -9917,6 +9930,14 @@ export function createToolLoopGuard({
         state.configuredWorkspaceRoot = capabilities.workspaceRoot;
         state.privateBrowserAccess = capabilities.privateBrowserAccess === true &&
           userMessageRequestsPrivateUrl(event?.messages, event?.prompt);
+        // before_prompt_build runs once per attempt, just after the runtime
+        // arms that attempt's own timer; the notices keep the response's
+        // schedule (run-deadline.mjs). Only the owner's own turns: subagent
+        // and cron lanes can run with another timeout or none, and team
+        // workers report to their coordinator, not the owner.
+        state.runDeadline = state.artifactOwnerInteractive && !state.managedTeamWorker
+          ? createRunDeadline(capabilities.runTimeoutSeconds, now(), state.runDeadline) : undefined;
+        state.runDeadlineReached = false;
       }
       if (typeof sessionId === "string" && sessionId) {
         state.currentSessionId = sessionId;
@@ -10238,6 +10259,10 @@ export function createToolLoopGuard({
     if (!state) return;
     if (phase === "start") state.compactionWindow = { calls: new Set(), started: 0 };
     else if (state.compactionWindow?.calls.size === 0) state.compactionWindow = undefined;
+    // The summary can drop a delivered run-deadline notice (keepRecentTokens
+    // is 8192 on a 131K model), so the stage now due is sent again, with the
+    // same bytes, on the next persisted result.
+    if (phase === "end" && state.runDeadline) state.runDeadline.notices = 0;
   }
 
   function observeModelCall(event, context, agentId = "pixel") {
@@ -10603,6 +10628,7 @@ export function createToolLoopGuard({
         ? completedMutation
         : undefined;
     if (successfulMutation) {
+      state.workspaceMutationObserved = true;
       state.invalidEditCreateBlocks = 0;
       state.oversizedEditBlocks = 0;
       state.noOpEditBlocks = 0;
@@ -10679,6 +10705,7 @@ export function createToolLoopGuard({
       }
     }
     const associateExecProject = directory => {
+      state.workspaceMutationObserved = true;
       if(typeof directory!=='string') return;
       try {onWorkspaceMutation({sessionKey:state.currentSessionKey,workspaceRoot:state.configuredWorkspaceRoot,directory,kind:'exec'});}
       catch {warn('Workspace project metadata could not be recorded.');}
@@ -11870,6 +11897,9 @@ export function createToolLoopGuard({
     if (message.isError === true && state?.progressBudget.laneExhausted(progressLane)) {
       return {message:{...message,content:[...(message.content ?? []),{type:'text',text:progressLaneStopReason(progressLane)}]}};
     }
+    // The only mid-attempt channel to the live model; never on a stopped run.
+    const deadlineNotice = state && !state.clientCancelled && !state.odsAborted
+      ? takeRunDeadlineNotice(state.runDeadline, now()) : undefined;
     const boundWebCall = pending &&
       (!state?.currentSessionId || sessionRuns.get(state.currentSessionId) === pending.runId) &&
       (!message.toolCallId || message.toolCallId === toolCallId) &&
@@ -12223,7 +12253,8 @@ export function createToolLoopGuard({
       !previewStageInstruction &&
       !controlNameRepair &&
       !sandboxPathCorrection &&
-      !executionGuidance
+      !executionGuidance &&
+      !deadlineNotice
     ) {
       return undefined;
     }
@@ -12293,6 +12324,8 @@ export function createToolLoopGuard({
         text: `${OPERATIONS_TRUSTED_CONTINUATION_PREFIX} ${continuation.instruction}`,
       });
     }
+    // Last, and a block of its own: the per-result cap keeps short blocks whole.
+    if (deadlineNotice) content.push({type: 'text', text: deadlineNotice});
     return {
       message: {
         ...compactMessage,
@@ -12586,10 +12619,16 @@ export function createToolLoopGuard({
   }
 
   // agent_end: a later cancel for this user can no longer name this run's
-  // request as the one it withdrew.
+  // request as the one it withdrew. It also classifies the runtime's run
+  // deadline, which no hook reports directly. An ODS stop (owner cancel, tool
+  // limit, recursive-delete refusal or any other guard abort) has its own
+  // delivery text.
   function observeAgentEnd(event, context) {
     const state = runs.get(context?.runId ?? event?.runId);
-    if (state) state.runEnded = true;
+    if (!state) return;
+    state.runEnded = true;
+    state.runDeadlineReached = !state.clientCancelled && !state.odsAborted && !state.progressBudget.exhausted &&
+      !state.recursiveDeleteDenied && runDeadlineReached(state.runDeadline, event, now());
   }
 
   // Model-only prompt context for one attempt (before_prompt_build
@@ -12853,7 +12892,6 @@ export function createToolLoopGuard({
             ? "Browser inspection passed for the submitted interaction checks only; this does not verify all requested behavior.\n\n" : "") +
           (state.workspaceVisibilityInteractionRequired && !interactionUnverified
             ? "Browser inspection passed for the submitted show/hide checks only; this does not verify all requested behavior.\n\n" : "") +
-          `${PREVIEW_STORAGE_DISCLOSURE}\n\n` +
           `${WORKSPACE_PREVIEW_PUBLISHED_DELIVERY_PREFIX}\n\n` +
           `[Open preview](${state.workspacePreview.url})\n\n` +
           (state.workspacePreviewModelAuthored
@@ -13123,6 +13161,19 @@ export function createToolLoopGuard({
       return {status:'failed', text:'ODS did not observe a verified managed installation receipt for this GitHub extension request.'};
     }
     if (state?.ownerQuestions && !state.clientCancelled) return {status:'pending',text:questionsText(state.ownerQuestions),questions:state.ownerQuestions};
+    // Replaces the runtime's advice to raise agents.defaults.timeoutSeconds,
+    // which ODS resets. Failure facts, such as a failed test, follow.
+    if (state?.runDeadlineReached && !state.clientCancelled) {
+      const failure = verification.status === 'failed' ? verification : undefined;
+      // A failure with a preview receipt, such as one edited since it was
+      // published, already links that preview and says what it does not prove.
+      const preview = failure?.preview ? undefined : progressStopPreview(state);
+      return {status: 'failed', text: [runDeadlineStopText(state.runDeadline, state.workspaceMutationObserved),
+        preview && `[Open last published preview](${preview.url})\n\nThis is the last verified publication, not proof that all requested work completed.`,
+        failure?.text].filter(Boolean).join('\n\n').slice(0, MAX_INGRESS_VERIFICATION_TEXT),
+      ...(failure?.preview ? {preview: failure.preview}
+        : preview ? {preview: {schemaVersion: 1, kind: 'ods-pixel-workspace-preview', ...preview}} : {})};
+    }
     // Completion assurance arms its terminal before a revision and is not
     // consulted after a stop, so a tool-limit answer is always the newer one.
     const synthesized = state?.stopSynthesisOutcome?.status === 'answered' ? state.stopSynthesisOutcome : undefined;

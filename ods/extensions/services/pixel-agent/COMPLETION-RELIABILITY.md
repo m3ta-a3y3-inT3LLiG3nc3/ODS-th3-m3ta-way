@@ -580,6 +580,88 @@ cancelled request. A later message sees none of this.
 before, during and after a revision is armed; the real-harness fixture
 `tests/runtime_cancel_recovery.integration.mjs` cancels through the ingress.
 
+## Run deadline
+
+OpenClaw stops each attempt at `agents.defaults.timeoutSeconds`, wherever the
+attempt is. The ODS installers pin it to 1800 seconds. This section does not
+change that policy, which is coupled to `diagnostics.stuckSessionAbortMs`, the
+session write-lock hold and the ingress and dashboard-api budgets.
+
+On the RTX Spark (2026-10-16, a 131K local model, after #7728 let long runs
+keep their context), one owner message asked for several game fixes. The run
+worked for exactly 30 minutes (288 model calls, 6 edits) and was still reading
+and editing when it stopped. `ui.js` already called `wolfHitShapes()`,
+`bossHitShapes()` and `WOLF_ZOOM`, but the `chars.js` edit that defines them
+had failed, so 4 of 6 levels threw `ReferenceError`. The owner saw "LLM request
+failed." and OpenClaw's advice to increase `agents.defaults.timeoutSeconds`,
+which ODS resets. The model had no warning that the deadline was near.
+
+`plugin/run-deadline.mjs` now handles both sides:
+
+- **The model is warned.** `before_prompt_build` runs once per attempt, just
+  after the runtime arms that attempt's timer. For the owner's own Portal turns
+  the guard records the configured timeout, when the response began (its first
+  attempt) and when this attempt began. When 5 minutes of the response remain
+  (at most a sixth of the timeout), and again at 2 minutes (at most a
+  fifteenth), the next persisted tool result ends with one fixed
+  `[ODS Pixel time limit]` block. It tells the model to finish or undo a partly
+  made change across files so the saved project still works, stop calling
+  tools, and tell the owner what is done, what is left, and that "continue"
+  resumes the rest.
+  - The schedule counts from the response, not the attempt. A retry, a
+    compaction retry or a revision gets a fresh runtime timer, but the ingress
+    stops the whole response at 1920 seconds, whatever attempt it is on. A
+    fresh schedule would place a later attempt's notices after that cut.
+  - Persisted results reach the live model through the ODS projection
+    (`host/openclaw-compaction-budget.json`). The block is short and separate,
+    so the per-result size cap keeps it whole.
+  - The text holds only durations from config, so its bytes are stable.
+  - Each stage is sent once per response. After a compaction, whose summary
+    can drop it (`keepRecentTokens` is 8192 on a 131K model), the stage now due
+    is sent again with the same bytes. A tool-limit stop, its tool-free answer
+    turn, an owner cancel and any other ODS abort get no notice.
+- **The owner is told what happened.** No hook reports the runtime's timeout
+  kind, so `agent_end` classifies it. All of these must hold:
+  - the attempt failed (`success: false`);
+  - the attempt, counted from its own start, ran at least the timeout minus
+    15 seconds;
+  - ODS did not stop it: no owner cancel, tool limit or recursive-delete
+    refusal, and no guard abort. The guard marks every run it aborts.
+  - its last assistant message is not a completed answer, which OpenClaw
+    delivers itself.
+
+  Delivery verification then returns `failed` with the text below, followed by
+  the last verified preview and any failure already recorded, such as a failed
+  test. When that failure already links a preview, for example because files
+  changed after it was published, the preview is linked once, by the failure.
+
+  > **Portal stopped this response after 30 minutes, the most one response can
+  > run.** This request needed more time. Files saved before the stop are kept,
+  > but the last change may be unfinished, so the project may not work yet.
+  > Send "continue" to pick up where it left off. If it keeps happening,
+  > [get help on Discord](https://discord.gg/4ntNp9MAwC).
+
+  The sentence about saved files appears only when the response changed
+  workspace files (a successful write, edit or exec). A research or chat
+  response gets only the limit and the "continue" step.
+
+  The ingress replaces the runtime text with it and reports `pixel_outcome`
+  `failed`. Channel delivery (`reply_payload_sending`) uses the same
+  verification. This also covers a deadline during a tool call, where OpenClaw
+  emits no timeout text at all.
+
+A deadline during compaction does not get this copy. The runtime extends that
+attempt by the compaction grace (`agents.defaults.compaction.timeoutSeconds`,
+which ODS also pins to 1800 seconds). That always outlasts the ingress's
+2-minute margin, so the response still ends with the dashboard's "Portal could
+not complete the response".
+
+Subagent, cron and team-worker runs get no notice or copy: subagent and cron
+lanes can use another timeout or none, and a team worker reports to its
+coordinator rather than the owner.
+`tests/run_deadline.test.mjs` and `tests/run_deadline_delivery.test.mjs`
+(including the real ingress over loopback) cover these paths.
+
 ## Search availability
 
 Existing SearXNG installations can report HTTP 200 with zero results while their
