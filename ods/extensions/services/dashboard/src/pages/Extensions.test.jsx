@@ -367,6 +367,79 @@ afterEach(() => {
   vi.unstubAllGlobals()
 })
 
+describe('built-in provenance and runtime state', () => {
+  it.each([
+    ['core', 'disabled', false, 'ODS is not currently reporting this service as healthy.'],
+    ['user', 'disabled', false, 'Installed but turned off — won’t start on restart'],
+    ['core', 'enabled', true, 'Service is running and healthy'],
+  ])('describes runtime evidence without inferring installation (source=%s, status=%s)', async (source, status, manageable, description) => {
+    installFetchMock({agent_available:true,extensions:[
+      {id:'runtime-evidence',name:'Runtime evidence',source,status,library_manageable:manageable,features:[baseFeature]},
+    ],summary:baseSummary()})
+    render(<Extensions compact />)
+    const card = within((await screen.findByRole('heading',{name:'Runtime evidence'})).closest('article'))
+    expect(card.getByText(description, {exact:true})).toBeInTheDocument()
+    if (source === 'core' && status === 'disabled') {
+      expect(card.queryByText(/Installed but turned off|won’t start on restart/)).toBeNull()
+    }
+  })
+
+  const states = [
+    ['disabled', {}, 'disabled'],
+    ['enabled', {}, 'enabled'],
+    ['installing', {runtime_starting: true}, 'starting'],
+    ['setting_up', {}, 'setting up'],
+    ['error', {}, 'error'],
+  ]
+  it.each([false, true].flatMap(compact => states.map(row => [compact, ...row])))(
+    'shows runtime state beside built-in provenance (compact=%s, status=%s)', async (compact, status, extra, label) => {
+      const ext = {id:'brave-search',name:'Brave Search',source:'core',category:'optional',
+        status,features:[{category:'search'}],...extra}
+      const fetchMock = installFetchMock({agent_available:true,extensions:[ext],summary:baseSummary()})
+      const catalogFetch = fetchMock.getMockImplementation()
+      fetchMock.mockImplementation(async (url, options) => String(url).includes('/progress')
+        ? makeJsonResponse({status:'idle'})
+        : catalogFetch(url, options))
+      render(<Extensions compact={compact} />)
+      const card = within((await screen.findByRole('heading',{name:'Brave Search'})).closest('article'))
+      expect(card.getByText(label, {exact:true})).toBeVisible()
+      expect(card.getByText('built-in')).toBeVisible()
+      expect(card.queryByText('core', {exact:true})).toBeNull()
+      expect(card.queryByRole('button',{name:/^(Enable|Disable|Install|Add)(?: |$)/})).toBeNull()
+      if (status === 'disabled') {
+        fireEvent.click(screen.getByRole('button',{name:'Installed 1'}))
+        const installed = within(screen.getByRole('heading',{name:'Brave Search'}).closest('article'))
+        expect(installed.getByText('disabled', {exact:true})).toBeVisible()
+        fireEvent.click(installed.getByRole('button',{name:'Details for Brave Search'}))
+        const details = within(screen.getByRole('dialog',{name:'Brave Search'}))
+        expect(details.getByText('disabled', {exact:true})).toBeVisible()
+        expect(details.getByText('optional', {exact:true})).toBeVisible()
+      }
+      expect(fetchMock.mock.calls.every(([, options]) => !options?.method || options.method === 'GET')).toBe(true)
+    })
+
+  it('preserves optional and third-party actions without inventing built-in provenance', async () => {
+    installFetchMock({agent_available:true,extensions:[
+      {id:'n8n',name:'Optional built-in',source:'core',status:'disabled',library_manageable:true,library_selected:false,features:[baseFeature]},
+      {id:'retained',name:'Retained extension',source:'user',status:'disabled',features:[baseFeature]},
+      {id:'available',name:'Available extension',source:'library',status:'not_installed',installable:true,features:[baseFeature]},
+    ],summary:baseSummary({total:3})})
+    render(<Extensions compact />)
+    const optional = within((await screen.findByRole('heading',{name:'Optional built-in'})).closest('article'))
+    expect(optional.getByText('built-in')).toBeVisible()
+    expect(optional.getByText('disabled', {exact:true})).toBeVisible()
+    expect(optional.getByRole('button',{name:'Add Optional built-in'})).toBeEnabled()
+    for (const name of ['Retained extension','Available extension']) {
+      const card = within(screen.getByRole('heading',{name}).closest('article'))
+      expect(card.queryByText('built-in')).toBeNull()
+    }
+    expect(screen.getByRole('button',{name:'Enable Retained extension'})).toBeEnabled()
+    expect(screen.getByRole('button',{name:'Installed 1'})).toBeVisible()
+    expect(screen.getByRole('button',{name:'Available 2'})).toBeVisible()
+    expect(within(screen.getByRole('heading',{name:'Available extension'}).closest('article')).getByRole('button',{name:'Install'})).toBeEnabled()
+  })
+})
+
 it('offers Add for qualified bundled n8n while keeping other built-ins managed by ODS', async () => {
   installFetchMock({agent_available:true,extensions:[
     {id:'n8n',name:'n8n (Workflows)',source:'core',status:'disabled',library_manageable:true,library_selected:false,features:[baseFeature]},
@@ -684,8 +757,7 @@ describe('Extensions page — unhealthy + install derivations', () => {
     const { container } = render(<Extensions />)
     await screen.findByText('Unhealthy Core Service')
 
-    // Core extensions render the "CORE" pill (L665-672) instead of StatusBadge
-    // and never get a toggle button — isToggleable requires source === 'user'.
+    // Runtime status does not grant controls to an unmanaged built-in.
     expect(findToggleButton(container)).toBeUndefined()
   })
 

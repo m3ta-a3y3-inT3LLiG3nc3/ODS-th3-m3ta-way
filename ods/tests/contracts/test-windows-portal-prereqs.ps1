@@ -58,6 +58,8 @@ Check ($installDir.Value -eq "/home/o'brien/ods `$(x)" -and $installDir.StringCo
 # Capacity gate: disk first, then virtualization only when WSL is not ready.
 function Get-ODSPortalFreeSystemGB { return $script:free }
 function Test-ODSPortalVirtualization { $script:virtChecked = $true; return $script:virt }
+# Setup loads this from wsl-portal-spark.ps1; these cases are an x64 PC.
+function Test-ODSSparkWindowsArm64 { return $false }
 foreach ($case in @(
     @{ free=39; virt=$true; ready=$false; ok=$false; name='39 GB free is refused before installing WSL' },
     @{ free=20; virt=$true; ready=$true; ok=$true; name='low space only warns when WSL is already installed (rerun)' },
@@ -69,6 +71,29 @@ foreach ($case in @(
     try { Assert-ODSPortalHostCapacity $case.ready } catch { $passed = $false }
     Check ($passed -eq $case.ok) $case.name
 }
+# The virtualization stop names the firmware setting the PC actually has. An
+# Arm PC has no Intel VT-x or AMD SVM setting.
+$x64Virtualization = 'Hardware virtualization is turned off, and WSL2 cannot run without it. Restart into your BIOS/UEFI settings, enable Intel VT-x (Intel Virtualization Technology) or AMD SVM, save, start Windows and rerun this command. Your PC maker''s support site names the exact menu.'
+foreach ($arm64 in @($false, $true)) {
+    $script:free = 80; $script:virt = $false
+    $script:arm64Asked = $false
+    $failure = & {
+        function Test-ODSSparkWindowsArm64 { $script:arm64Asked = $true; return $arm64 }
+        try { Assert-ODSPortalHostCapacity $false; '' } catch { $_.Exception.Message }
+    }
+    if ($arm64) {
+        Check ($failure -match 'firmware \(UEFI\) settings' -and $failure -match 'Turn on virtualization' -and
+            $failure -notmatch 'Intel|AMD|VT-x|SVM' -and $script:arm64Asked) 'on Windows on Arm the virtualization stop names the UEFI firmware setting, not Intel or AMD'
+    } else {
+        Check ($failure -ceq $x64Virtualization) 'on x64 the virtualization stop is unchanged'
+    }
+}
+$script:virt = $true; $script:arm64Asked = $false
+& {
+    function Test-ODSSparkWindowsArm64 { $script:arm64Asked = $true; return $true }
+    Assert-ODSPortalHostCapacity $false
+}
+Check (-not $script:arm64Asked) 'the architecture is read only when setup stops for virtualization'
 
 # Docker inside the distro: a bounded wait that stops at the first answer
 # or at the deadline, never beyond it.

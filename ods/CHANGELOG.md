@@ -6,7 +6,78 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added
+- Portal's workspace includes one finished example project, Elf of Doom, a
+  small browser game Portal wrote in ODS from natural-language prompts. The
+  installer adds `Playground/elf-of-doom` whenever that name is absent and the
+  workspace has never received it (a private record in Portal's state folder,
+  outside the workspace the agent's sandbox mounts, records that and which
+  copy ODS itself added), so it never adds a deleted or renamed copy again;
+  it never replaces, merges into or deletes an existing entry, and an owner's
+  own earlier `Playground/elf-of-doom` stays ordinary owner content. The
+  added game sits in Portal's sidebar under Projects > Playground like any
+  other project while the folder exists; clicking it plays the game in the
+  Workspace panel with no model run. Portal changes Elf of Doom only when
+  your message starts with "In elf-of-doom,", for example "In elf-of-doom,
+  make the arrows give 7"; when Portal changes it while working on anything
+  else, ODS puts it back and says so, moving what it takes out (such as a
+  file or folder Portal moved in) to a new
+  `Playground/elf-of-doom-recovered-<UTC time>` folder instead of deleting
+  it, and changes you make yourself while Portal is idle stay. To remove it,
+  delete the folder; ODS never adds it
+  back. Existing Linux and Windows (WSL2) installs get it on their next
+  installer run; Macs get it on a new install or the next native Portal
+  update.
+- Portal's agent sandbox now has Node.js, so the agent can run and test the
+  JavaScript it writes. Before, it could only read its code: on a browser game
+  it tried `node` and got "not found", built stand-in harnesses in Python, and
+  canvas state leaks and a per-hit freeze shipped and survived many turns.
+  - Pixel 4.3.32 installs the official Node.js 24.21.0 `node` binary in the
+    sandbox image, pinned by SHA-256 for amd64 and arm64. npm, npx and
+    corepack are not included and the sandbox keeps no network, so the agent
+    can run `node --check`, scripts and `node --test` offline but cannot
+    install packages. Its memory, process and file limits are unchanged.
+  - The image is the same for Linux, WSL (including Arm64) and native macOS
+    Pixel. Bootstrap and macOS preparation run its `node` once offline and stop
+    before any live change if the version, architecture or package-manager
+    check fails, with the cause, the recovery step and the Discord help link.
+  - The agent's instructions say the sandbox has node without npm, and the
+    verification guide shows how to check browser code offline: syntax
+    checks, logic tests and a small harness that stubs the page and canvas.
+    Browser behaviour is still verified on the published preview.
+  - Building the sandbox image now also downloads Node.js from nodejs.org
+    (about 31 MB). Existing installations get it through a normal ODS update.
+    Rolling back restores the previous image, which has no node.
+  - A red `node --check`, `node --test` or harness run that exits 1 with
+    output is recorded as a test result, not a failed tool call, so an edit
+    and test loop no longer ends the response at the 12-failure total, nor
+    one failing syntax check per file at the 4-failure streak. A missing
+    node or script, a timeout and a crash without output still count.
+  - A macOS native update removes the previous agent sandbox container before
+    the new gateway starts, as Linux and WSL already do. Before, a container
+    used in the last five minutes kept serving the old image without node
+    while the agent was told node is there.
+  - The Node.js download gives up on a stalled connection instead of hanging
+    the install, and the Linux bootstrap's node check is bounded and removes
+    its own container. A stale sandbox image that fails that check now gets its
+    own message with the `docker image rm` command, instead of the
+    network-problem message.
+
 ### Fixed
+- On an NVIDIA GPU of compute capability 12.1, the DGX Spark GB10 and the RTX
+  Spark N1X, the model no longer answers with question marks. llama.cpp's CUDA
+  12 container images, the default among them, have no kernels for that GPU;
+  the installer now records the GPU's compute capability and runs llama.cpp's
+  CUDA 13 build of the same release (`server-cuda13-b11429`, pinned by digest)
+  there, and Models-page switches and their rollbacks keep it. Every other
+  NVIDIA GPU keeps its image, and an image you set yourself is kept. Existing
+  installs switch on their next installer run. `ods doctor` names the RTX Spark
+  beside the DGX Spark in its sm_121 check, and its fix now says to rerun the
+  installer.
+- Under Docker Desktop without an NVIDIA runtime, the Linux installer stops
+  with the cause, what to do and a link to the ODS Discord instead of
+  installing a second NVIDIA container toolkit and restarting a Docker service
+  that Docker Desktop does not use.
 - `ods status` now respects `GPU_BACKEND`, using the existing AMD and Apple
   GPU reporters instead of choosing NVIDIA tooling merely because it is
   installed. AMD device counting in `ods gpu status` uses DRM sysfs, and

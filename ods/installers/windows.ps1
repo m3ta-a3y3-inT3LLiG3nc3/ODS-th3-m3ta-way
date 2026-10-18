@@ -274,11 +274,11 @@ if ($installerExitCode -eq 0 -and $lifetimeRequired -and '--pixel' -cin $Passthr
     if ($installerExitCode -eq 0 -and $OpenPortal) {
         $portalUrl = @($verifyOutput | ForEach-Object { if ($_ -match '^ODS_PORTAL_URL=(http://localhost:[0-9]{1,5}/pixel)$') { $Matches[1] } } | Select-Object -Last 1)
         if ($portalUrl.Count -eq 1) {
-            $desktopFolder = [Environment]::GetFolderPath('Desktop')
-            if ($desktopFolder) {
-                Set-Content -LiteralPath (Join-Path $desktopFolder 'ODS Portal.url') -Value @('[InternetShortcut]', "URL=$($portalUrl[0])") -Encoding ASCII
-                Write-Host "Created the desktop shortcut 'ODS Portal'."
-            }
+            # The ODS app (an Edge app window with the ODS icon), or the
+            # 'ODS Portal' web link when Edge or the shortcut is unavailable.
+            . (Join-Path $PSScriptRoot 'windows/lib/app-shortcut.ps1')
+            $appIcon = Join-Path (Split-Path -Parent $PSScriptRoot) 'extensions/services/dashboard/public/osmantic-os.ico'
+            $null = Publish-ODSPortalShortcut -PortalUrl $portalUrl[0] -IconSource $appIcon
             Write-Host "Opening Portal: $($portalUrl[0])"
             Start-Process $portalUrl[0]
         }

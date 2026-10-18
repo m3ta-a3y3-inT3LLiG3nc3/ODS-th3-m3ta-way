@@ -3,6 +3,8 @@
 # after a restart. Each step asks first, changes only its own prerequisite and
 # stops with instructions when it cannot finish. ODS itself is still installed
 # only by install-core.sh inside Ubuntu.
+# Requires wsl-portal-spark.ps1 (Test-ODSSparkWindowsArm64) in scope;
+# wsl-portal-setup.ps1 loads both.
 
 $script:ODSPortalMinimumFreeGB = 40
 # Docker Desktop's first engine start can take several minutes.
@@ -85,8 +87,16 @@ function Assert-ODSPortalHostCapacity([bool]$WslReady) {
         Write-Host "Only $free GB is free on the Windows drive. $need; setup continues because WSL is already installed. If a download fails, free space and rerun." -ForegroundColor Yellow
     }
     if (-not $WslReady -and -not (Test-ODSPortalVirtualization)) {
-        throw 'Hardware virtualization is turned off, and WSL2 cannot run without it. Restart into your BIOS/UEFI settings, enable Intel VT-x (Intel Virtualization Technology) or AMD SVM, save, start Windows and rerun this command. Your PC maker''s support site names the exact menu.'
+        throw (Get-ODSPortalVirtualizationOffMessage (Test-ODSSparkWindowsArm64))
     }
+}
+
+function Get-ODSPortalVirtualizationOffMessage([bool]$Arm64) {
+    # Arm PCs have no Intel VT-x or AMD SVM setting to look for.
+    if ($Arm64) {
+        return 'Hardware virtualization is turned off, and WSL2 cannot run without it. Turn on virtualization in your PC''s firmware (UEFI) settings, save, start Windows and rerun this command. Your PC maker''s support site names the exact menu.'
+    }
+    return 'Hardware virtualization is turned off, and WSL2 cannot run without it. Restart into your BIOS/UEFI settings, enable Intel VT-x (Intel Virtualization Technology) or AMD SVM, save, start Windows and rerun this command. Your PC maker''s support site names the exact menu.'
 }
 
 # --------------------------------------------------------------- Docker Desktop

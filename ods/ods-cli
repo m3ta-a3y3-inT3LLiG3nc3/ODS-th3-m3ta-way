@@ -1851,6 +1851,7 @@ cmd_restart() {
         read -ra flags <<< "$flags_str"
     fi
 
+    local restarted_mode="${ODS_MODE:-}"
     if [[ -z "$resolved_service" ]]; then
         _compose_run_with_summary "Restarting all services" \
             "${flags[@]}" up -d --force-recreate --no-build --pull never
@@ -1875,6 +1876,13 @@ cmd_restart() {
     # default agent path can still return a startup error.
     if [[ -z "$resolved_service" || "$resolved_service" == "hermes" ]]; then
         _ods_cli_wait_for_hermes_ready_with_retry "${flags[@]}"
+    fi
+
+    # `ods mode` changes .env, while the native agent deliberately pins its
+    # startup mode. Refresh that process only after the complete stack has
+    # applied the new environment, never on an unrelated service restart.
+    if [[ -z "$resolved_service" && -f "$INSTALL_DIR/bin/ods-host-agent.py" ]]; then
+        cmd_agent refresh-mode "$restarted_mode" || return 1
     fi
 
     if [[ -z "$resolved_service" || "$resolved_service" == "llama-server" ]]; then
@@ -2907,9 +2915,9 @@ dgx_check = runtime.get('dgx_spark_cuda_arch_check', {})
 dgx_status = dgx_check.get('status')
 dgx_message = dgx_check.get('message', '')
 if dgx_status == 'pass':
-    print(f"  {GREEN}✓{NC} DGX Spark llama-server CUDA arch")
+    print(f"  {GREEN}✓{NC} DGX Spark / RTX Spark llama-server CUDA arch")
 elif dgx_status == 'warn':
-    print(f"  {YELLOW}⚠{NC} DGX Spark llama-server CUDA arch: {dgx_message}")
+    print(f"  {YELLOW}⚠{NC} DGX Spark / RTX Spark llama-server CUDA arch: {dgx_message}")
 
 amd_runtime = runtime.get('amd_runtime', {})
 if amd_runtime.get('available'):
@@ -5351,6 +5359,77 @@ cmd_rollback() {
     bash "$INSTALL_DIR/ods-update.sh" rollback ${target:+"$target"}
 }
 
+_agent_mode_snapshot() {
+    local key port host payload
+    key="$(_env_get_raw ODS_AGENT_KEY)"
+    [[ -n "$key" ]] || key="$(_env_get_raw DASHBOARD_API_KEY)"
+    case "$key" in
+        \"*\") key="${key:1:${#key}-2}" ;;
+        \'*\') key="${key:1:${#key}-2}" ;;
+    esac
+    [[ -n "$key" && "$key" != *$'\n'* && "$key" != *$'\r'* ]] || return 1
+    port="$(_env_get_raw ODS_AGENT_PORT)"
+    port="${port#\"}"; port="${port%\"}"
+    port="${port#\'}"; port="${port%\'}"
+    [[ "$port" =~ ^[0-9]+$ ]] || port=7710
+    host="$(_agent_probe_host)"
+    # Keep credentials off argv and out of diagnostics, including on failure.
+    payload=$(printf 'Authorization: Bearer %s\n' "$key" | \
+        curl --silent --fail --max-time 3 --header @- \
+            "http://${host}:${port}/v1/model/config" 2>/dev/null) || return 1
+    printf '%s' "$payload" | jq -ers 'select(length == 1) | .[0] |
+        select(.configuredMode == "local" or .configuredMode == "cloud" or .configuredMode == "hybrid") |
+        select(.effectiveMode == "local" or .effectiveMode == "cloud" or .effectiveMode == "hybrid" or .effectiveMode == "unknown") |
+        [.effectiveMode, .configuredMode] | join(" ")' 2>/dev/null
+}
+
+_agent_refresh_mode() {
+    local snapshot effective configured expected attempt
+    expected="${1:-}"
+    expected="${expected#\"}"; expected="${expected%\"}"
+    expected="${expected#\'}"; expected="${expected%\'}"
+    expected="$(printf '%s' "$expected" | tr '[:upper:]' '[:lower:]')"
+    [[ "$expected" != lemonade ]] || expected=local
+    case "$expected" in
+        local|cloud|hybrid) ;;
+        *) log_error "The restarted stack's ODS mode is unknown. Check .env and run 'ods restart' before changing models."; return 1 ;;
+    esac
+    if ! snapshot="$(_agent_mode_snapshot)"; then
+        log_error "Services restarted, but the host-agent runtime mode could not be verified. Run 'ods agent restart', then 'ods restart' before changing models."
+        return 1
+    fi
+    read -r effective configured <<< "$snapshot"
+    if [[ "$configured" != "$expected" ]]; then
+        log_error "ODS mode changed during the stack restart. Run 'ods restart' to apply the current configuration."
+        return 1
+    fi
+    [[ "$effective" != "$configured" ]] || return 0
+    # Unknown startup mode means this process started without a valid mode.
+    # A fresh authenticated configured mode plus the completed stack restart
+    # authorizes restarting it; it does not authorize bypassing the swap gate.
+    log "Refreshing host agent for $configured mode (startup mode: $effective)..."
+    if ! cmd_agent restart; then
+        log_error "Services restarted, but the host agent did not restart. Run 'ods agent restart', then 'ods restart' before changing models."
+        return 1
+    fi
+    for attempt in {1..10}; do
+        if snapshot="$(_agent_mode_snapshot)"; then
+            read -r effective configured <<< "$snapshot"
+            if [[ "$configured" != "$expected" ]]; then
+                log_error "ODS mode changed again during restart. Run 'ods restart' to apply the current configuration."
+                return 1
+            fi
+            if [[ "$effective" == "$configured" ]]; then
+                success "Host agent is running in $configured mode"
+                return 0
+            fi
+        fi
+        sleep 0.5
+    done
+    log_error "The restarted host agent has not confirmed $expected mode. Check 'ods agent logs', then run 'ods restart' before changing models."
+    return 1
+}
+
 cmd_agent() {
     check_install
     load_env 2>/dev/null || true
@@ -5397,6 +5476,9 @@ cmd_agent() {
     fi
 
     case "$action" in
+        refresh-mode)
+            _agent_refresh_mode "${2:-}"
+            ;;
         status)
             if _agent_health_ready; then
                 success "ODS host agent: running (port ${port}, ${daemon_type})"

@@ -1631,6 +1631,14 @@ def _failure_message(error):
     # the update. Any other text, which could carry a path, stays out.
     code = str(error) if isinstance(error, (UpgradeError, RuntimeError)) else ""
     detail = f" (reason: {code})" if re.fullmatch(r"[a-z][a-z0-9-]{0,95}", code) else ""
+    if code == "source-previous-hold-pending":
+        # Unload model keeps Portal admission held until Resume model, and a
+        # Windows rerun restarts the model without releasing that hold. The
+        # generic text below only said "recover"; name the owner's way out.
+        return (f"Portal is paused by an unfinished model change, such as Unload model{detail}, so the "
+                "Pixel update did not start. Open the ODS dashboard's Models page and choose Recover model "
+                "switch (or run 'ods model recover'); if the model is still unloaded, choose Resume model "
+                "instead. Then run the installer again. The paused state and source snapshots were kept.")
     edge_reason = {
         "source-edge-ownership-unverified": "The stopped Pixel Edge could not be bound to this installation and its original private volume.",
         "source-edge-clean-stop-required": "Pixel Edge is not a cleanly exited container; automatic restart was refused.",

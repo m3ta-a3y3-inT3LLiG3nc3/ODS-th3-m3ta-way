@@ -1,6 +1,7 @@
 # Prerequisite orchestration; actual installation remains in install-core.sh.
 . (Join-Path $PSScriptRoot 'wsl-portal-prereqs.ps1')
 . (Join-Path $PSScriptRoot 'wsl-portal-amd.ps1')
+. (Join-Path $PSScriptRoot 'wsl-portal-spark.ps1')
 
 function Write-ODSPortalStage([int]$Step, [string]$Title, [string]$Detail) {
     Write-Host ''

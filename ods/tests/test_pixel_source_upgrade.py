@@ -1519,3 +1519,23 @@ def test_changed_pixel_source_requires_a_strictly_newer_release(tmp_path, monkey
         with pytest.raises(upgrade.UpgradeError, match='source-new-version-required'):
             upgrade._stage(manager, account, str(tmp_path / 'candidate'), 'b' * 40)
         assert staged == []
+
+
+@pytest.mark.parametrize('error', [upgrade.UpgradeError('source-previous-hold-pending'),
+                                   RuntimeError('source-previous-hold-pending')])
+def test_a_held_model_change_names_the_owner_way_out_and_keeps_the_hold(error):
+    # An installer rerun after Unload model meets the admission hold that
+    # Unload keeps until Resume. The refusal names the dashboard actions that
+    # release it instead of the generic "recover the verified state".
+    message = upgrade._failure_message(error)
+    assert '(reason: source-previous-hold-pending)' in message
+    assert 'Recover model switch' in message and "ods model recover" in message
+    assert 'Resume model' in message and 'run the installer again' in message
+    assert 'paused state and source snapshots were kept' in message
+    assert 'clean install' not in message
+
+
+def test_other_hold_refusals_keep_the_generic_preserve_text():
+    message = upgrade._failure_message(upgrade.UpgradeError('source-resume-identity-changed'))
+    assert 'Preserve any existing admission hold' in message
+    assert 'Recover model switch' not in message

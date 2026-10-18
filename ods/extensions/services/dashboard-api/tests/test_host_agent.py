@@ -10201,6 +10201,20 @@ class TestDockerServiceHealthSnapshot:
 
 class TestModelConfig:
 
+    @pytest.mark.parametrize(("startup", "expected"), [
+        ("local", "local"), ("cloud", "cloud"), ("hybrid", "hybrid"),
+        ("lemonade", "local"), (None, "unknown"), ("private-fixture", "unknown"),
+    ])
+    def test_effective_mode_is_bounded_startup_identity(self, tmp_path, monkeypatch, startup, expected):
+        monkeypatch.setattr(_mod, "INSTALL_DIR", tmp_path)
+        monkeypatch.setattr(_mod, "AGENT_API_KEY", "test-key")
+        monkeypatch.setattr(_mod, "STARTUP_ODS_MODE", startup)
+        monkeypatch.setenv("ODS_MODE", "cloud")
+        (tmp_path / ".env").write_text("ODS_MODE=local\nHF_TOKEN=private-fixture\n", encoding="utf-8")
+        handler = _FakeHandler(b"")
+        _mod.AgentHandler._handle_model_config(handler)
+        assert handler.parse_response() == {"configuredMode": "local", "effectiveMode": expected}
+
     @pytest.mark.parametrize(("contents", "expected"), [
         (None, "unknown"), ("", "unknown"), ("ODS_MODE=\n", "unknown"),
         ("ODS_MODE=invalid\n", "unknown"),
@@ -10218,7 +10232,7 @@ class TestModelConfig:
         handler = _FakeHandler(b"")
         _mod.AgentHandler._handle_model_config(handler)
         assert handler.response_code == 200
-        assert handler.parse_response() == {"configuredMode": expected}
+        assert handler.parse_response() == {"configuredMode": expected, "effectiveMode": "hybrid"}
         assert ("Cache-Control", "no-store") in handler.response_headers
 
     @pytest.mark.parametrize("failure", [PermissionError, UnicodeError])
@@ -10235,7 +10249,7 @@ class TestModelConfig:
         monkeypatch.setattr(_mod, "load_env", denied)
         handler = _FakeHandler(b"")
         _mod.AgentHandler._handle_model_config(handler)
-        assert handler.parse_response() == {"configuredMode": "unknown"}
+        assert handler.parse_response() == {"configuredMode": "unknown", "effectiveMode": "local"}
 
     def test_authenticated_fixed_route_reads_atomic_replacement(self, tmp_path, monkeypatch):
         import urllib.error
@@ -10268,7 +10282,7 @@ class TestModelConfig:
             headers = {"Authorization": "Bearer model-config-secret"}
             for mode in ("local", "cloud"):
                 with urllib.request.urlopen(urllib.request.Request(url, headers=headers), timeout=2) as response:
-                    assert json.load(response) == {"configuredMode": mode}
+                    assert json.load(response) == {"configuredMode": mode, "effectiveMode": "hybrid"}
                     assert response.headers["Cache-Control"] == "no-store"
                 if mode == "local":
                     replacement = tmp_path / ".env-new"
@@ -10550,6 +10564,9 @@ class TestWslNativeSystemMetrics:
         monkeypatch.setenv("WSL_INTEROP", "/run/WSL/42_interop")
         monkeypatch.setattr(_mod.os, "scandir", lambda p: nullcontext(iter([])))
         monkeypatch.setattr(_mod.Path, "is_file", lambda p: True)
+        monkeypatch.setattr(_mod, "_wsl_nvidia_cached", (0, None))
+        # The model server runs on Windows unless a test says otherwise.
+        monkeypatch.setattr(_mod, "_wsl_windows_model_route", lambda: True)
         return json.loads((Path(__file__).parent / "fixtures/wsl-windows-native-telemetry.json").read_text())
 
     def test_real_bound_adapter_and_one_shared_snapshot(self, monkeypatch, native):
@@ -10596,6 +10613,150 @@ class TestWslNativeSystemMetrics:
         monkeypatch.setattr(_mod.Path, "is_file", lambda p: False)
         monkeypatch.setattr(_mod.subprocess, "run", lambda *a, **kw: pytest.fail("must not launch"))
         assert _mod._wsl_system_metrics() is None
+
+    SPARK = "NVIDIA RTX Spark N1X (6144-core Blackwell RTX GPU)"
+
+    def test_nvidia_adapter_carries_the_windows_driver_temperature_and_power(self, monkeypatch, native):
+        # A model server that runs on Windows: DXGI gives memory and load, and
+        # WSL's nvidia-smi, which reads the Windows driver, adds temperature and
+        # power. "[N/A]" stays unknown; an AMD adapter beside it gets nothing.
+        nvidia = {**native["gpus"][0], "name": self.SPARK, "vendor": 0x10DE, "luid": "luid_0x00000000_0x00017000"}
+        sample = {**native, "gpus": [nvidia, native["gpus"][0]]}
+        calls = []
+
+        def run(args, **kwargs):
+            calls.append(args[0])
+            if args[0] == "/usr/lib/wsl/lib/nvidia-smi":
+                assert args[1:] == ["--query-gpu=name,temperature.gpu,power.draw", "--format=csv,noheader,nounits"]
+                assert 0.5 <= kwargs["timeout"] <= 2
+                # A reading under the AMD adapter's name is never given to it.
+                return types.SimpleNamespace(returncode=0, stdout=(
+                    f"{self.SPARK}, 69, 58.72\nNVIDIA NPU, 70, [N/A]\n{native['gpus'][0]['name']}, 50, 20\n"))
+            return types.SimpleNamespace(returncode=0, stdout=json.dumps(sample))
+        monkeypatch.setattr(_mod.subprocess, "run", run)
+        rows = _mod._wsl_system_metrics()["gpus"]
+        assert rows[0]["backend"] == "nvidia" and rows[0]["temperature_c"] == 69 and rows[0]["power_w"] == 58.72
+        assert rows[1]["backend"] == "amd" and rows[1]["temperature_c"] is None and rows[1]["power_w"] is None
+        assert calls.count("/usr/lib/wsl/lib/nvidia-smi") == 1
+        assert _mod._wsl_nvidia_sensors(2)["NVIDIA NPU"] == {"temperature_c": 70, "power_w": None}
+
+    def test_nvidia_readings_are_reused_for_fifteen_seconds(self, monkeypatch, native):
+        # nvidia-smi can wake a sleeping GPU: the 3 s CPU/RAM/GPU sample
+        # refreshes, the NVIDIA readings only every 15 s.
+        nvidia = {**native["gpus"][0], "name": self.SPARK, "vendor": 0x10DE}
+        clock = [1000.0]
+        monkeypatch.setattr(_mod.time, "monotonic", lambda: clock[0])
+        calls = []
+        readings = iter(["69, 58.72", "71, 60"])
+
+        def run(args, **kwargs):
+            calls.append(args[0])
+            if args[0] == "/usr/lib/wsl/lib/nvidia-smi":
+                return types.SimpleNamespace(returncode=0, stdout=f"{self.SPARK}, {next(readings)}\n")
+            return types.SimpleNamespace(returncode=0, stdout=json.dumps({**native, "gpus": [nvidia]}))
+        monkeypatch.setattr(_mod.subprocess, "run", run)
+        assert _mod._wsl_system_metrics()["gpus"][0]["temperature_c"] == 69
+        clock[0] += 10
+        assert _mod._wsl_system_metrics()["gpus"][0]["temperature_c"] == 69
+        assert calls.count("/usr/lib/wsl/lib/nvidia-smi") == 1 and len(calls) == 3
+        clock[0] += 6
+        assert _mod._wsl_system_metrics()["gpus"][0]["temperature_c"] == 71
+        assert calls.count("/usr/lib/wsl/lib/nvidia-smi") == 2
+
+    def test_docker_nvidia_cpu_and_cloud_routes_never_run_nvidia_smi(self, monkeypatch, native):
+        # Only a Windows model server makes the GPU tile read this sample; the
+        # Docker NVIDIA route reads nvidia-smi in the dashboard container.
+        monkeypatch.setattr(_mod, "_wsl_windows_model_route", lambda: False)
+        nvidia = {**native["gpus"][0], "name": self.SPARK, "vendor": 0x10DE}
+
+        def run(args, **kwargs):
+            assert args[0] != "/usr/lib/wsl/lib/nvidia-smi", "only a Windows model server needs host NVIDIA sensors"
+            return types.SimpleNamespace(returncode=0, stdout=json.dumps({**native, "gpus": [nvidia]}))
+        monkeypatch.setattr(_mod.subprocess, "run", run)
+        row = _mod._wsl_system_metrics()["gpus"][0]
+        assert row["memory_total_mb"] == 32768 and row["temperature_c"] is None and row["power_w"] is None
+
+    @pytest.mark.parametrize("env_text,expected", [
+        ("ODS_HOST_LLM_TRANSPORT=model-router\n", True),
+        ("LEMONADE_HOST_TRANSPORT=model-router\n", True),
+        ("GPU_BACKEND=nvidia\n", False),
+        (None, False),
+        (b"\xff\xfe not utf-8", False),
+    ])
+    def test_windows_model_route_is_read_from_the_installation(self, monkeypatch, tmp_path, env_text, expected):
+        monkeypatch.setattr(_mod.platform, "system", lambda: "Linux")
+        monkeypatch.setattr(_mod.platform, "release", lambda: "6.6.114-microsoft-standard-WSL2")
+        monkeypatch.setattr(_mod, "INSTALL_DIR", tmp_path)
+        if isinstance(env_text, bytes):
+            (tmp_path / ".env").write_bytes(env_text)
+        elif env_text is not None:
+            (tmp_path / ".env").write_text(env_text)
+        assert _mod._wsl_windows_model_route() is expected
+
+    def test_out_of_range_readings_and_comma_names(self, monkeypatch, native):
+        # nvidia-smi does not quote names: the last two fields are the readings.
+        # Values outside 0-150 C and 0-2000 W are not sensor readings.
+        comma = {**native["gpus"][0], "name": "NVIDIA RTX 5090, Founders Edition", "vendor": 0x10DE,
+                 "luid": "luid_0x00000000_0x00017001"}
+        hot = {**native["gpus"][0], "name": self.SPARK, "vendor": 0x10DE, "luid": "luid_0x00000000_0x00017002"}
+
+        def run(args, **kwargs):
+            if args[0] == "/usr/lib/wsl/lib/nvidia-smi":
+                return types.SimpleNamespace(returncode=0, stdout=(
+                    f"NVIDIA RTX 5090, Founders Edition, 61, 300.5\n{self.SPARK}, 200, 5000\n"))
+            return types.SimpleNamespace(returncode=0, stdout=json.dumps({**native, "gpus": [comma, hot]}))
+        monkeypatch.setattr(_mod.subprocess, "run", run)
+        rows = _mod._wsl_system_metrics()["gpus"]
+        assert rows[0]["temperature_c"] == 61 and rows[0]["power_w"] == 300.5
+        assert rows[1]["temperature_c"] is None and rows[1]["power_w"] is None
+
+    def test_amd_adapter_never_runs_nvidia_smi(self, monkeypatch, native):
+        def run(args, **kwargs):
+            assert args[0] != "/usr/lib/wsl/lib/nvidia-smi", "an AMD host must not query NVIDIA sensors"
+            return types.SimpleNamespace(returncode=0, stdout=json.dumps(native))
+        monkeypatch.setattr(_mod.subprocess, "run", run)
+        row = _mod._wsl_system_metrics()["gpus"][0]
+        assert row["temperature_c"] is None and row["power_w"] is None
+
+    def test_two_gpus_with_one_name_get_no_guessed_reading(self, monkeypatch, native):
+        # nvidia-smi rows are matched to DXGI adapters by name; a repeated name
+        # cannot say which reading belongs to which adapter.
+        twins = [{**native["gpus"][0], "name": "NVIDIA GeForce RTX 4090", "vendor": 0x10DE, "luid": f"luid_0x00000000_0x0001700{index}"}
+                 for index in range(2)]
+
+        def run(args, **kwargs):
+            if args[0] == "/usr/lib/wsl/lib/nvidia-smi":
+                return types.SimpleNamespace(returncode=0, stdout="NVIDIA GeForce RTX 4090, 60, 100\nNVIDIA GeForce RTX 4090, 80, 300\n")
+            return types.SimpleNamespace(returncode=0, stdout=json.dumps({**native, "gpus": twins}))
+        monkeypatch.setattr(_mod.subprocess, "run", run)
+        rows = _mod._wsl_system_metrics()["gpus"]
+        assert len(rows) == 2 and all(row["temperature_c"] is None and row["power_w"] is None for row in rows)
+
+    @pytest.mark.parametrize("smi", ["missing", "fails", "oversized", "times-out", "slow-sample"])
+    def test_unavailable_nvidia_sensors_keep_the_rest_of_the_sample(self, monkeypatch, native, smi):
+        nvidia = {**native["gpus"][0], "name": self.SPARK, "vendor": 0x10DE}
+        clock = [1000.0]
+        monkeypatch.setattr(_mod.time, "monotonic", lambda: clock[0])
+        if smi == "missing":
+            monkeypatch.setattr(_mod.Path, "is_file", lambda p: p.as_posix() != "/usr/lib/wsl/lib/nvidia-smi")
+
+        def run(args, **kwargs):
+            if args[0] == "/usr/lib/wsl/lib/nvidia-smi":
+                assert smi in ("fails", "oversized", "times-out"), "nvidia-smi must not run without the time or the binary"
+                if smi == "times-out":
+                    raise subprocess.TimeoutExpired(args, kwargs["timeout"])
+                # A failed or oversized answer is not trusted, even with a valid row.
+                row = f"{self.SPARK}, 69, 58.72\n"
+                if smi == "oversized":
+                    return types.SimpleNamespace(returncode=0, stdout=row + "x" * 65536)
+                return types.SimpleNamespace(returncode=9, stdout=row)
+            if smi == "slow-sample":
+                clock[0] += 8.2  # the Windows sensor read used most of the dashboard's wait
+            return types.SimpleNamespace(returncode=0, stdout=json.dumps({**native, "gpus": [nvidia]}))
+        monkeypatch.setattr(_mod.subprocess, "run", run)
+        result = _mod._wsl_system_metrics()
+        assert result["cpu"]["percent"] == 86 and result["gpus"][0]["memory_total_mb"] == 32768
+        assert result["gpus"][0]["temperature_c"] is None and result["gpus"][0]["power_w"] is None
 
 
 class TestWslServiceInterop:

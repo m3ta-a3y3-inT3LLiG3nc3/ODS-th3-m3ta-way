@@ -1875,6 +1875,10 @@ def _newly_measured_tps(metrics: dict, loaded_model: str | None) -> float:
     return float(metrics.get("tokens_per_second") or 0)
 
 
+_RUNTIME_ERROR_LIMIT = 1024
+_START_REFUSALS = ("memory_refused", "gpu_busy")
+
+
 def _model_management_proof() -> dict:
     """The host agent's management proof, with whether its launcher loads a vision projector."""
     if not _windows_hosted_runtime():
@@ -1892,6 +1896,13 @@ def _model_management_proof() -> dict:
         result["vision"] = value["managed"] and value.get("vision") is True
         if isinstance(value.get('reason'), str):
             result['reason'] = value['reason'][:500]
+        # Why a managed Windows model is not running (the launcher's own
+        # error), and a memory refusal its Resume overrides ("Start anyway").
+        error = value.get("runtimeError")
+        if value["managed"] and not value["running"] and isinstance(error, str) and error.strip():
+            result["runtimeError"] = error[:_RUNTIME_ERROR_LIMIT]
+            if value.get("startRefusal") in _START_REFUSALS:
+                result["startRefusal"] = value["startRefusal"]
         return result
     except (AgentClientError, ValueError):
         # A failed proof is unknown, not evidence of an independently managed service.

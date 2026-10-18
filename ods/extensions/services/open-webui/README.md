@@ -140,10 +140,21 @@ stop Open WebUI and restore the copy as above.
 
 ## Tool calling
 
-Since Open WebUI 0.10, chats and models that have not chosen a function-calling
-mode use **Native** tool calling, which relies on the model's own tool support.
-If a local model does not handle tools well, set **Function Calling** to
-**Legacy** for that model, or for all models in the default model parameters.
+ODS defaults Open WebUI's **Function Calling** to **Legacy**. A downloaded
+model can answer ordinary chat while failing native tool calls; Open WebUI's
+upstream Native default can otherwise inject helper tools into a plain chat
+and turn its reply into a provider error. This is a compatibility default,
+not an automatic adjustment to each model's capability profile.
+
+Legacy keeps explicitly selected tools and the Web Search, Image Generation,
+and Code Interpreter feature handlers available, subject to their usual setup
+and permissions. Automatic native built-in helpers are not injected by
+default. For a model with working native tools, explicitly choose **Native**
+in that model's parameters or in the chat's Function Calling setting. Existing
+per-model and chat choices take precedence over ODS's default and are retained
+when switching the model behind `ods/current`. A saved Native choice therefore
+still needs a model that can handle native tools; changing models does not
+silently replace that choice.
 
 ## First Use
 

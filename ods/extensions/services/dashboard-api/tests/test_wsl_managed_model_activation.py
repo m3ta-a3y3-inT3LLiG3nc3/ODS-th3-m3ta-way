@@ -303,6 +303,32 @@ def test_start_without_pending_journal_cannot_claim_success_for_another_startup_
     assert "windows-start" not in managed["events"] or managed["pixel"]["pending"] is True
 
 
+def test_resume_of_a_memory_refused_model_starts_it_anyway(managed, monkeypatch):
+    # Sign-in left the saved plan refused for memory: intent running, the
+    # model not running, the launcher's refusal in status. The Models page's
+    # Resume ("Start anyway") is the ordinary start; the Windows controller
+    # turns it into the override for that plan.
+    managed["runtime"]["running"] = False
+    fixture_status = host._wsl_runtime.status
+    refusal = {"runtimeError": "The model was not started: Windows can lend it only 1.0 GiB right now.",
+               "runtimeErrorSource": "launcher", "startRefusal": "memory_refused"}
+    monkeypatch.setattr(host._wsl_runtime, "status", lambda *args: {
+        **fixture_status(*args), **({} if managed["runtime"]["running"] else refusal)})
+    monkeypatch.setattr(host, "_model_management_cache", None)
+    monkeypatch.setattr(host, "_model_management_lock", threading.Lock())
+    code, shown = host._model_management_snapshot()
+    assert code == 200 and shown["startRefusal"] == "memory_refused" and shown["canUnload"] is True
+    assert shown["running"] is False and shown["runtimeError"].startswith("The model was not started")
+    handler = fixtures._ResponseHandler(request_body={})
+    host.AgentHandler._handle_model_runtime(handler, "start")
+    assert handler.response_code == 200, handler.parse_response()
+    assert managed["events"].count("windows-start") == 1
+    assert managed["runtime"]["running"] is True
+    monkeypatch.setattr(host, "_model_management_cache", None)
+    code, shown = host._model_management_snapshot()
+    assert code == 200 and shown["running"] is True and "runtimeError" not in shown and "startRefusal" not in shown
+
+
 def test_start_after_external_exit_holds_and_recovers_portal_before_success(managed):
     managed["runtime"]["running"] = False
     handler = fixtures._ResponseHandler(request_body={})

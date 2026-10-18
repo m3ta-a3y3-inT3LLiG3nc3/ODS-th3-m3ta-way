@@ -876,6 +876,9 @@ export default function Extensions({ compact = false }) {
 function StatusBadge({ status, statusStyle, ext, gpuBackend, onConsole }) {
   const runtimeStarting = status === 'installing' && ext.runtime_starting === true
   let tooltip = runtimeStarting ? 'Service is starting; waiting for its health check' : STATUS_DESCRIPTIONS[status] || ''
+  if (status === 'disabled' && ext.source === 'core' && ext.library_manageable !== true) {
+    tooltip = 'ODS is not currently reporting this service as healthy.'
+  }
   if (status === 'incompatible') {
     tooltip += ` \u2014 requires ${ext.gpu_backends?.join(' or ') || 'specific GPU'}, your system: ${gpuBackend || 'unknown'}`
   }
@@ -988,16 +991,15 @@ function ExtensionCard({ ext, hermesProxy, gpuBackend, agentAvailable, onDetails
           </div>
           <div className="flex flex-wrap items-center justify-end gap-2">
             <LlmSwapBadge llm={ext.llm} />
-            {isCore && !isManagedBuiltin ? (
+            {isCore && (
               <span
                 className="text-[10px] px-2 py-0.5 rounded-full bg-blue-500/10 text-blue-400 border border-blue-500/15 uppercase tracking-wider cursor-help"
-                title={ext.id === 'open-webui' && webuiSelection?.supported && webuiSelection.enabled === false ? 'Optional chat service available to add' : 'Built-in service — managed by ODS'}
+                title="Bundled with ODS; runtime status is shown separately"
               >
-                {ext.id === 'open-webui' && webuiSelection?.supported && webuiSelection.enabled === false ? 'optional' : 'core'}
+                built-in
               </span>
-            ) : (
-              <StatusBadge status={status} statusStyle={statusStyle} ext={ext} gpuBackend={gpuBackend} onConsole={onConsole} />
             )}
+            <StatusBadge status={status} statusStyle={statusStyle} ext={ext} gpuBackend={gpuBackend} onConsole={onConsole} />
             {isToggleable && (
               <button
                 disabled={actionDisabled}

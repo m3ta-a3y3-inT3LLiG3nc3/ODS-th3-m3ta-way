@@ -2278,6 +2278,10 @@ def _model_management_snapshot() -> tuple[int, dict]:
                 result = (200, {'managed': managed, 'canActivate': running,
                                 'canUnload': managed, 'running': running,
                                 'vision': _wsl_runtime.supports_projector(value)})
+                # Why the Windows model is not running, as its launcher wrote
+                # it (the bridge bounds the text); a memory refusal makes the
+                # Models page's Resume "Start anyway".
+                result[1].update(_wsl_runtime.launcher_error(value))
             except (OSError, ValueError, RuntimeError, subprocess.TimeoutExpired) as exc:
                 logger.warning('Windows runtime management verification failed: %s', exc)
                 result = unavailable
@@ -3605,6 +3609,20 @@ def _profiled_pixel_reasoning(configured: bool, traits: dict | None) -> bool:
     return configured
 
 
+def _pixel_image_input_readback(configured: str, proof: dict | None) -> str:
+    """Pixel's image input once ODS's own llama-server proved the activated model.
+
+    ``proof`` is ``_wait_for_model_readiness``'s proof for that model, whose
+    ``vision`` is the same ``/props`` answer's ``modalities.vision``. llama.cpp
+    reports true only while a vision projector (mmproj) is loaded, so true
+    declares image input supported. False, absent or unreadable keeps the
+    configured value: a missing report is not evidence either way.
+    """
+    if isinstance(proof, dict) and proof.get("vision") is True:
+        return "supported"
+    return configured
+
+
 def _profiled_pixel_image_input(configured: str, traits: dict | None) -> str:
     """Pixel's image input from the vision probe when a projector was loaded (WP4.2)."""
     vision = (traits or {}).get("vision")
@@ -3691,7 +3709,7 @@ def _reconcile_ods_managed_pixel_model(
     owner, home = identity
     env_values = load_env(INSTALL_DIR / ".env")
     configured_ref = str(env_values.get("PIXEL_SOURCE_REF") or "")
-    bundled_ref = "2ef78e7067211a198748c5499ed5a0261f4b48b6"
+    bundled_ref = "4bf2203c56cce323490e41e36736062d4f74cf39"
     source_url = str(env_values.get("PIXEL_SOURCE_URL") or "bundled")
     if any(character in source_url for character in "\r\n\x00"):
         raise RuntimeError("The configured Pixel source URL is invalid")
@@ -9699,6 +9717,76 @@ def _wsl_sensor_run(command):
     raise OSError("No usable trusted WSL telemetry interop session")
 
 
+def _wsl_nvidia_sensors(timeout: float) -> dict[str, dict]:
+    """Temperature and power per NVIDIA GPU name, from the Windows driver.
+
+    DXGI gives memory and load but no sensors. WSL's nvidia-smi reads the
+    Windows NVIDIA driver directly, so it needs no interop session and works
+    whether or not this stack's containers use the GPU (a model server that
+    runs on Windows). A name listed twice is ambiguous and gets no reading.
+    """
+    smi = "/usr/lib/wsl/lib/nvidia-smi"
+    if not Path(smi).is_file():
+        return {}
+    try:
+        result = subprocess.run([smi, "--query-gpu=name,temperature.gpu,power.draw",
+                                 "--format=csv,noheader,nounits"], capture_output=True, text=True,
+                                encoding="utf-8", errors="replace", timeout=timeout)
+    except (OSError, subprocess.SubprocessError):
+        return {}
+    if result.returncode != 0 or len(result.stdout) > 65536:
+        return {}
+
+    def reading(text: str, maximum: float) -> float | None:
+        try:
+            value = float(text)
+        except ValueError:
+            return None  # "[N/A]" where the driver has no such sensor
+        return value if math.isfinite(value) and 0 <= value <= maximum else None
+
+    sensors: dict[str, dict] = {}
+    duplicates = set()
+    for line in result.stdout.splitlines()[:32]:
+        fields = [field.strip() for field in line.rsplit(",", 2)]
+        if len(fields) != 3 or not fields[0]:
+            continue
+        if fields[0] in sensors:
+            duplicates.add(fields[0])
+        sensors[fields[0]] = {"temperature_c": reading(fields[1], 150), "power_w": reading(fields[2], 2000)}
+    return {name: value for name, value in sensors.items() if name not in duplicates}
+
+
+# nvidia-smi can wake a GPU that was asleep, so its readings are reused this
+# long, well past the three-second CPU/RAM/GPU sample.
+_WSL_NVIDIA_SENSOR_SECONDS = 15
+_wsl_nvidia_cached = (0.0, None)
+
+
+def _wsl_windows_model_route() -> bool:
+    """True when this installation's model server runs natively on Windows.
+
+    Only then does the GPU tile read the Windows host sample; the Docker
+    NVIDIA route reads nvidia-smi in the dashboard container instead, and CPU
+    or cloud mode needs no GPU sensors.
+    """
+    try:
+        return _wsl_runtime.candidate(load_env(INSTALL_DIR / ".env"))
+    except (OSError, ValueError):
+        return False  # An unreadable .env only skips the optional GPU sensors.
+
+
+def _wsl_nvidia_sensor_sample(budget: float) -> dict[str, dict]:
+    """nvidia-smi readings, at most once per fifteen seconds (caller holds the metrics lock)."""
+    global _wsl_nvidia_cached
+    if _wsl_nvidia_cached[1] is not None and time.monotonic() - _wsl_nvidia_cached[0] < _WSL_NVIDIA_SENSOR_SECONDS:
+        return _wsl_nvidia_cached[1]
+    if budget < 0.5:
+        return {}
+    sensors = _wsl_nvidia_sensors(budget)
+    _wsl_nvidia_cached = (time.monotonic(), sensors)
+    return sensors
+
+
 def _wsl_system_metrics():
     """Read native Windows sensors through existing WSL interop, without setup."""
     global _wsl_metrics_cached
@@ -9721,6 +9809,7 @@ def _wsl_system_metrics():
             if not math.isfinite(value) or value < 0 or (maximum is not None and value > maximum):
                 return None
             return value
+        started = time.monotonic()
         try:
             result = _wsl_sensor_run(
                 [executable, "-NoLogo", "-NoProfile", "-NonInteractive", "-EncodedCommand",
@@ -9740,6 +9829,13 @@ def _wsl_system_metrics():
                 if used is not None:
                     payload["ram"].update(used_gb=round(used / 1024**3, 1), percent=round(used / total * 100, 1))
             rows = data.get("gpus")
+            # The dashboard waits nine seconds for this sample: nvidia-smi gets
+            # what the Windows sensor read left, at most two seconds. It runs
+            # only for an NVIDIA adapter that a Windows model server uses.
+            budget = min(2.0, 8.5 - (time.monotonic() - started))
+            nvidia = _wsl_nvidia_sensor_sample(budget) if isinstance(rows, list) and any(
+                isinstance(row, dict) and row.get("vendor") == 0x10DE for row in rows[:32]
+            ) and _wsl_windows_model_route() else {}
             if isinstance(rows, list):
                 for row in rows[:32]:
                     if not isinstance(row, dict):
@@ -9753,13 +9849,15 @@ def _wsl_system_metrics():
                     # DXGI's dedicated allocation is real capacity. Shared capacity
                     # is a borrowing limit, not additional physical VRAM.
                     usage = number(row.get("dedicatedUsedBytes"), capacity)
+                    sensors = nvidia.get(name.strip(), {}) if row.get("vendor") == 0x10DE else {}
                     payload["gpus"].append({
                         "name": name[:128], "uuid": luid,
                         "memory_total_mb": int(capacity // 1024**2),
                         "memory_used_mb": int(usage // 1024**2) if usage is not None else None,
                         "memory_type": "unified" if _is_windows_amd_integrated_gpu_name(name) else "discrete",
                         "memory_scope": "dedicated", "utilization_percent": number(row.get("utilizationPercent"), 100),
-                        "temperature_c": None, "source": "windows-dxgi-cim",
+                        "temperature_c": sensors.get("temperature_c"), "power_w": sensors.get("power_w"),
+                        "source": "windows-dxgi-cim",
                         "backend": "amd" if row.get("vendor") == 0x1002 else "nvidia" if row.get("vendor") == 0x10DE else "unknown",
                     })
         except (OSError, subprocess.SubprocessError, ValueError):
@@ -13137,14 +13235,17 @@ class AgentHandler(BaseHTTPRequestHandler):
             json_response(self, 500, {"error": f"Failed to list models: {exc}"})
 
     def _handle_model_config(self):
-        """Expose only the fresh persisted mode, never private .env values."""
+        """Expose the two bounded mode identities, never private .env values."""
         if not check_auth(self):
             return
         try:
             mode = _normalize_ods_mode(load_env(INSTALL_DIR / ".env").get("ODS_MODE"))
         except (OSError, UnicodeError):
             mode = "unknown"
-        json_response(self, 200, {"configuredMode": mode}, no_store=True)
+        json_response(self, 200, {
+            "configuredMode": mode,
+            "effectiveMode": _normalize_ods_mode(STARTUP_ODS_MODE),
+        }, no_store=True)
 
     def _handle_model_status(self):
         """Return current model download progress."""
@@ -14818,6 +14919,19 @@ class AgentHandler(BaseHTTPRequestHandler):
                     # runs the backend default again; a host or owner image that
                     # no catalog model names is kept.
                     remove_keys.add("LLAMA_SERVER_IMAGE")
+                if gpu_backend not in {"apple", "amd"}:
+                    # A compute-12.1 GPU names its CUDA 13 build here: the
+                    # backend default (no key) is a CUDA 12 build.
+                    if "LLAMA_SERVER_IMAGE" in updates:
+                        env_image = updates["LLAMA_SERVER_IMAGE"]
+                    elif "LLAMA_SERVER_IMAGE" in remove_keys:
+                        env_image = ""
+                    else:
+                        env_image = str(env_pre.get("LLAMA_SERVER_IMAGE") or "").strip()
+                    compute_image = _llama_image_for_compute(env_image, env_pre)
+                    if compute_image != env_image:
+                        updates["LLAMA_SERVER_IMAGE"] = compute_image
+                        remove_keys.discard("LLAMA_SERVER_IMAGE")
                 # A vision import loads its projector in the container (WP2);
                 # any other model clears the previous one's. Host-native
                 # runtimes take the projector as an argument instead.
@@ -14974,14 +15088,15 @@ class AgentHandler(BaseHTTPRequestHandler):
                     # container; a catalog or .env image names a CUDA build.
                     override_image = ""
                 else:
-                    override_image = (
+                    override_image = _llama_image_for_compute(
                         llama_server_image
                         or env.get("LLAMA_SERVER_IMAGE")
                         or (
                             "ghcr.io/ggml-org/llama.cpp:server-cuda-b11429@sha256:883915ea20a4b350e98f7284098f4d400c21e9b366e248d397cd42d90602a84c"
                             if gpu_backend == "nvidia"
                             else ""
-                        )
+                        ),
+                        env,
                     )
                 runtime_restart_strategy = "container-llama"
                 if _switchboard_adapters is not None:
@@ -15256,8 +15371,13 @@ class AgentHandler(BaseHTTPRequestHandler):
                     'maxTokens': _pixel_max_tokens_for_context(int(context_length)),
                     'reasoning': _profiled_pixel_reasoning(
                         _pixel_model_reasoning_capable(str(llm_model_name), env), profile_traits),
+                    # Computed for this model alone: a model without a loaded
+                    # projector gets today's value back, never the previous
+                    # model's readback. A measured vision probe
+                    # (ODS_MODEL_PROFILES=enabled) still decides last.
                     'imageInput': _profiled_pixel_image_input(
-                        _pixel_model_image_input(model_id), profile_traits),
+                        _pixel_image_input_readback(_pixel_model_image_input(model_id), final_runtime_proof),
+                        profile_traits),
                 }
                 pixel_status = (pixel_transaction.apply(pixel_target) if pixel_transaction is not None
                     else _reconcile_ods_managed_pixel_model(
@@ -16388,23 +16508,28 @@ def _model_agent_viable(model: dict, context_length: int) -> bool:
     )
 
 
-def _llama_runtime_props(env: dict) -> tuple[int, str]:
-    """Return llama.cpp's actual ``n_ctx`` and served model file from /props.
+def _llama_runtime_props(env: dict) -> tuple[int, str, bool | None]:
+    """Return llama.cpp's actual ``n_ctx``, served model file and vision from /props.
 
     The file is the basename of ``model_path`` (empty when not reported).
-    Unreachable or malformed answers report ``(0, "")``.
+    Vision is ``modalities.vision`` when /props reports it as a boolean;
+    llama.cpp reports true only while a vision projector (mmproj) is loaded.
+    Any other value is None. Unreachable or malformed answers report
+    ``(0, "", None)``.
     """
     try:
         data = json.loads(_runtime_http(env, "/props") or "{}")
     except (json.JSONDecodeError, OSError, subprocess.TimeoutExpired):
-        return 0, ""
+        return 0, "", None
     if not isinstance(data, dict):
-        return 0, ""
+        return 0, "", None
     settings = data.get("default_generation_settings")
     n_ctx = (_positive_int(settings.get("n_ctx")) or 0) if isinstance(settings, dict) else 0
     model_path = data.get("model_path")
     served = re.split(r"[\\/]", model_path.strip())[-1] if isinstance(model_path, str) else ""
-    return n_ctx, served
+    modalities = data.get("modalities")
+    vision = modalities.get("vision") if isinstance(modalities, dict) else None
+    return n_ctx, served, vision if type(vision) is bool else None
 
 
 def _llama_runtime_context_length(env: dict) -> int:
@@ -16838,7 +16963,9 @@ def _wait_for_model_readiness(
     visible content from the same model.
 
     Legacy callers receive a boolean. Identity callers receive the concrete
-    runtime identity. Adapters receive identity, actual context, and proof time.
+    runtime identity. Adapters receive identity, actual context, and proof time,
+    plus ``vision`` when that same ``/props`` answer reported
+    ``modalities.vision`` as a boolean.
 
     ``fast_poll_seconds`` opts into dense probing (every
     ``fast_poll_interval``) for that long *before* the regular schedule, for
@@ -16912,6 +17039,7 @@ def _wait_for_model_readiness(
             return not_ready
         runtime_identity = ""
         runtime_context = 0
+        runtime_vision = None
         try:
             health = _runtime_health(env)
             body = _runtime_http(env, "/v1/models").strip() if health == "ok" else ""
@@ -16929,7 +17057,7 @@ def _wait_for_model_readiness(
                 llm_model_name=llm_model_name,
             ) if body else ""
             if runtime_identity:
-                runtime_context, served_file = _llama_runtime_props(env)
+                runtime_context, served_file, runtime_vision = _llama_runtime_props(env)
                 if served_file and not _runtime_model_identity_matches(
                     served_file, gguf_file=gguf_file,
                 ):
@@ -16970,12 +17098,17 @@ def _wait_for_model_readiness(
                     reported_context = runtime_context or expected_context or 0
                     if reported_context <= 0:
                         return {}
-                    return {
+                    proof = {
                         "identity": runtime_identity,
                         "contextLength": reported_context,
                         "contextVerified": runtime_context > 0,
                         "verifiedAt": _iso_now(),
                     }
+                    # The same /props answer's modalities.vision, only when
+                    # it reported one (_pixel_image_input_readback reads it).
+                    if runtime_vision is not None:
+                        proof["vision"] = runtime_vision
+                    return proof
                 return runtime_identity if return_identity else True
             if runtime_identity:
                 # Loaded and serving, yet no visible answer: never leave the
@@ -17193,6 +17326,11 @@ def _runtime_llama_api_base(env: dict) -> str:
     """Container-visible OpenAI base (``.../v1``) of the managed llama-server."""
     if _runtime_uses_router_transport(env) or _is_windows_host_llama_server(env):
         return f"{_native_llm_container_origin(env)}/v1"
+    if str(env.get("GPU_BACKEND") or "").strip().lower() == "apple":
+        # Public mode URLs select consumers, not the native server's origin.
+        host = str(env.get("ODS_MACOS_HOST_GATEWAY") or "").strip() or "host.docker.internal"
+        port = str(env.get("ODS_NATIVE_LLAMA_PORT") or env.get("OLLAMA_PORT") or "8080")
+        return f"http://{host}:{port}/v1"
     configured = str(env.get("LLM_API_URL") or "").strip()
     if configured and "litellm" not in configured.lower():
         return configured
@@ -17251,10 +17389,50 @@ def _container_llama_rollback_image(env: dict) -> str:
 
     The AMD overlay pins its own image; a persisted LLAMA_SERVER_IMAGE can
     name another backend's (CUDA) build, so AMD always keeps the inspected one.
+    A compute-12.1 GPU rolls back to its CUDA 13 build, never to a CUDA 12 one
+    (_llama_image_for_compute).
     """
     if str(env.get("GPU_BACKEND") or "").strip().lower() == "amd":
         return ""
-    return str(env.get("LLAMA_SERVER_IMAGE") or "")
+    return _llama_image_for_compute(str(env.get("LLAMA_SERVER_IMAGE") or ""), env)
+
+
+# The repository stays separate so the pin contract does not read these
+# prefixes as unpinned image references.
+_LLAMA_CPP_REPOSITORY = "ghcr.io/ggml-org/llama.cpp"
+# llama.cpp's CUDA 12 images. They have no kernels for compute capability 12.1
+# (DGX Spark GB10, RTX Spark N1X) and answer "????" there; the CUDA 13 build
+# (server-cuda13-*) has them.
+_CUDA12_LLAMA_IMAGE_PREFIXES = (
+    f"{_LLAMA_CPP_REPOSITORY}:server-cuda-",
+    f"{_LLAMA_CPP_REPOSITORY}:server-cuda12-",
+)
+
+
+def _llama_image_for_compute(image: str, env: dict) -> str:
+    """The llama-server container image for this GPU's compute capability.
+
+    The installer records GPU_COMPUTE_CAP in .env, and
+    config/backends/nvidia.json runtime.llama_server.container_images_by_compute
+    pins the image a compute capability needs (installer phase 06 applies the
+    same map). On such an NVIDIA GPU the pinned image replaces a CUDA 12
+    llama.cpp build and the empty value, which means the backend default, a
+    CUDA 12 build. A CUDA 13 build, another backend's image and an owner's own
+    image are kept, and every other host gets ``image`` back unchanged.
+    """
+    image = str(image or "").strip()
+    if str(env.get("GPU_BACKEND") or "").strip().lower() != "nvidia":
+        return image
+    compute_cap = str(env.get("GPU_COMPUTE_CAP") or "").strip()
+    if not compute_cap:
+        return image
+    contract_path = INSTALL_DIR / "config" / "backends" / "nvidia.json"
+    contract = json.loads(contract_path.read_text(encoding="utf-8"))
+    images = contract["runtime"]["llama_server"].get("container_images_by_compute", {})
+    pinned = str(images.get(compute_cap) or "").strip()
+    if pinned and (not image or image.startswith(_CUDA12_LLAMA_IMAGE_PREFIXES)):
+        return pinned
+    return image
 
 
 def _write_host_native_litellm_config(env: dict, gguf_file: str, model: str) -> None:

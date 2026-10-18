@@ -147,6 +147,9 @@ services:
       # ODS pins and updates Open WebUI itself; the upstream "new version"
       # check only calls GitHub and advertises releases ODS has not qualified.
       ENABLE_VERSION_UPDATE_CHECK: "false"
+      # Arbitrary local models may answer chat but fail native tool calling.
+      # Explicit per-model or chat Native settings override this default.
+      DEFAULT_MODEL_PARAMS: '{"function_calling":"legacy"}'
       # Switchboard: OPEN_WEBUI_LLM_BASE_URL overrides to the LiteLLM gateway
       # (ods/current) in enabled mode; default is byte-identical to the prior
       # direct llama-server route for legacy/observe.
