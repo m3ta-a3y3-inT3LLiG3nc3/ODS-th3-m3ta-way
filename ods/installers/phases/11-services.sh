@@ -1454,7 +1454,7 @@ MODELS_INI_EOF
     compose_ok=false
     # Build local images individually so every failure is reported before the
     # installer refuses to launch any potentially stale image.
-    _candidate_build_services=(dashboard dashboard-api model-router remote-provider-egress remote-provider-ssh-tunnel ape token-spy privacy-shield brave-search pixel-edge pixel-model-relay pixel-inference langfuse-minio langfuse-minio-init)
+    _candidate_build_services=(dashboard dashboard-api model-router remote-provider-egress remote-provider-ssh-tunnel ape token-spy privacy-shield brave-search integration-gateway pixel-edge pixel-model-relay pixel-inference langfuse-minio langfuse-minio-init)
     [[ "$ENABLE_COMFYUI" == "true" ]] && _candidate_build_services+=(comfyui)
     if ! _enabled_compose_services="$($DOCKER_COMPOSE_CMD "${COMPOSE_FLAGS_ARR[@]}" config --services 2>>"$LOG_FILE")"; then
         ai_bad "Could not resolve compose services before local image builds."

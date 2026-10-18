@@ -1317,6 +1317,9 @@ if ($dryRun) {
         if (Test-ODSWindowsServiceEnabled -ServiceId "brave-search" -Plan $servicePlan) {
             $_buildServices += "brave-search"
         }
+        if (Test-ODSWindowsServiceEnabled -ServiceId "integration-gateway" -Plan $servicePlan) {
+            $_buildServices += "integration-gateway"
+        }
         if ($enableComfyui -and $currentBackend -eq "nvidia" -and -not $script:gpuPassthroughFailed) {
             $_buildServices += "comfyui"
         }
