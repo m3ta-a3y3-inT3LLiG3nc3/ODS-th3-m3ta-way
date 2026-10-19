@@ -287,6 +287,10 @@ _ALLOWED_CORE_RECREATE_IDS = frozenset({
     "tts", "whisper", "embeddings", "token-spy", "comfyui",
     "ape", "privacy-shield", "model-router",
 })
+# Pixel's model relay picks its upstream (model-router, or LiteLLM in cloud
+# mode) from ODS_MODE once, when it starts. A remote-provider route change
+# therefore recreates it with LiteLLM, or Portal keeps the old model.
+_PIXEL_MODEL_RELAY_CONTAINER = "ods-pixel-model-relay"
 
 
 def _to_bash_path(path: Path) -> str:
@@ -1065,15 +1069,89 @@ def _download_bytes_needed(artifacts: list[dict], paths: dict[str, Path]) -> int
 
 
 def _model_storage_status(models_dir: Path) -> dict:
-    """Free and total bytes of the volume that holds models_dir."""
+    """Free and total bytes of the volume that holds models_dir.
+
+    On WSL that volume is normally the distribution's virtual disk, which
+    reports its ~1 TB growth limit instead of the Windows drive that stores
+    it; that drive is then checked too (_wsl_model_storage_status).
+    """
     probe = Path(models_dir)
     while not probe.exists() and probe != probe.parent:
         probe = probe.parent
     usage = shutil.disk_usage(probe)
+    if _is_wsl_linux() and _on_wsl_virtual_disk(probe):
+        drive, host = _wsl_disk_drive_usage()
+        return _wsl_model_storage_status(usage, drive, host)
     return {
         "freeBytes": int(usage.free),
         "totalBytes": int(usage.total),
         "marginBytes": _download_disk_margin(int(usage.total)),
+    }
+
+
+# Windows setup records the drive that stores this distribution's virtual
+# disk (ext4.vhdx, the distribution's BasePath); see wsl-portal-prereqs.ps1.
+_WSL_DISK_DRIVE_KEY = "ODS_WSL_DISK_DRIVE"
+
+
+def _on_wsl_virtual_disk(path: Path) -> bool:
+    """Is path on the distribution's own virtual disk, its root filesystem?
+
+    A Windows drive mount (DrvFS) or another mounted disk is not, and reports
+    its own free space already.
+    """
+    return os.stat(path).st_dev == os.stat("/").st_dev
+
+
+def _wsl_disk_drive_usage() -> tuple[str | None, object | None]:
+    """The recorded Windows drive under WSL's virtual disk, and its usage.
+
+    ``(None, None)`` when Windows setup has not recorded the drive or it
+    cannot be read from this distribution; each case is logged.
+    """
+    drive = str(load_env(INSTALL_DIR / ".env").get(_WSL_DISK_DRIVE_KEY) or "").strip().upper()
+    if not re.fullmatch(r"[A-Z]:", drive):
+        logger.warning("%s is missing or invalid, so free space on the Windows drive under WSL is not "
+                       "checked; rerun install.ps1 to record it", _WSL_DISK_DRIVE_KEY)
+        return None, None
+    try:
+        mount = _wsl_runtime.drive_mount(drive)
+        # Without its DrvFS mount the drive's directory is plain storage on
+        # the virtual disk itself, which would only repeat its figures.
+        usage = None if _on_wsl_virtual_disk(mount) else shutil.disk_usage(mount)
+    except (OSError, ValueError, subprocess.TimeoutExpired) as exc:
+        logger.warning("Free space on Windows drive %s could not be checked: %s", drive, exc)
+        return None, None
+    if usage is None:
+        logger.warning("Windows drive %s is not mounted in WSL; its free space was not checked", drive)
+        return None, None
+    return drive, usage
+
+
+def _wsl_model_storage_status(disk, drive: str | None, host) -> dict:
+    """Download space on WSL's virtual disk, bounded by the Windows drive under it.
+
+    ``disk`` and ``host`` are ``shutil.disk_usage`` results. The virtual disk
+    grows into the Windows drive, and a full drive breaks Windows and WSL, so
+    free space is never more than that drive has and the margin follows its
+    size. ``windowsDrive`` names the drive when its free space is the figure
+    reported. Without a readable drive (``host`` is None) only the virtual
+    disk is known, and ``windowsDriveChecked`` says so.
+    """
+    if host is None:
+        return {
+            "freeBytes": int(disk.free),
+            "totalBytes": int(disk.total),
+            "marginBytes": _download_disk_margin(int(disk.total)),
+            "windowsDrive": None,
+            "windowsDriveChecked": False,
+        }
+    return {
+        "freeBytes": min(int(disk.free), int(host.free)),
+        "totalBytes": int(host.total),
+        "marginBytes": _download_disk_margin(int(host.total)),
+        "windowsDrive": drive if int(host.free) <= int(disk.free) else None,
+        "windowsDriveChecked": True,
     }
 
 
@@ -3809,6 +3887,15 @@ class _RemoteProviderApplyError(RuntimeError):
         self.rollback = rollback
 
 
+class _RemoteProviderNotServing(RuntimeError):
+    """The active route's consumers match, but the provider serves no completion."""
+
+    def __init__(self, provider_status: int, provider_message: str) -> None:
+        super().__init__("The remote provider did not serve a completion through the active route")
+        self.provider_status = provider_status
+        self.provider_message = provider_message
+
+
 def _remote_provider_root() -> Path:
     return DATA_DIR / "remote-provider"
 
@@ -4374,6 +4461,7 @@ def _valid_managed_pixel_runtime_contract(value: object) -> bool:
         and 1 <= max_tokens <= context_length
         and type(reasoning) is bool
         and ("imageInput" not in value or value["imageInput"] in ("supported", "unsupported", "unknown"))
+        and ("thinkingControl" not in value or value["thinkingControl"] in ("enable_thinking", "always", "none"))
         and ("routeFingerprint" not in value or (
             isinstance(value["routeFingerprint"], str)
             and re.fullmatch(r"[a-f0-9]{64}", value["routeFingerprint"]) is not None
@@ -4656,7 +4744,13 @@ def _prove_pixel_model_contract(config: dict, contract: dict) -> bool:
         if not _valid_managed_pixel_runtime_contract(contract) or expected != observed:
             logger.warning("Portal model contract proof failed: the contract does not match the saved remote route")
             return False
-        _verify_litellm_route(config, model='ods/current')
+        try:
+            _verify_litellm_route(config, model='ods/current')
+        except RuntimeError:
+            # A provider outage is an unproven route. Callers retain the hold
+            # and can report an eligible explicit recovery without replaying it.
+            logger.warning("Portal model contract proof failed: the saved remote route did not pass its live completion check")
+            return False
         return True
     gguf = str(config.get('GGUF_FILE') or '')
     if not gguf:
@@ -5245,10 +5339,23 @@ def _verify_current_remote_provider_consumers(
     pixel = _managed_pixel_runtime_contract()
     if pixel is not None and pixel != runtime:
         return None
-    try:
-        _verify_litellm_route(env, model="ods/current")
-    except RuntimeError:
-        return None
+    failure = _litellm_route_failure(env)
+    if failure is not None and failure[2]:
+        # LiteLLM and its egress hop work, but the provider fails chats. A new
+        # activation would recreate LiteLLM and hold Portal's model lane through
+        # an outage it cannot fix (fleet 2026-10-18: a test took ~80 s and said
+        # nothing). A single 429 or 503 is not an outage, so ask once more.
+        time.sleep(2)
+        failure = _litellm_route_failure(env)
+        if failure is not None and failure[2] and failure[0] is not None:
+            raise _RemoteProviderNotServing(failure[0], failure[1])
+    if failure is not None:
+        # LiteLLM's own fault, or a LiteLLM that is still starting: give it the
+        # earlier time to answer, then let the repair path recreate it.
+        try:
+            _verify_litellm_route(env, model="ods/current")
+        except RuntimeError:
+            return None
     activation = {
         "active": True,
         "gateway": "litellm-cloud",
@@ -5287,6 +5394,27 @@ def _render_remote_provider_cloud_config(route: dict, env: dict[str, str]) -> No
         raise RuntimeError("Could not render the remote-provider LiteLLM route")
 
 
+def _refresh_pixel_model_relay(state: dict[str, bool]) -> None:
+    """Recreate a relay that was running so it takes the route .env now names."""
+    if _restart_existing_container(_PIXEL_MODEL_RELAY_CONTAINER, state, recreate=True):
+        _wait_for_container_health(_PIXEL_MODEL_RELAY_CONTAINER)
+
+
+def _restore_pixel_model_relay(state: dict[str, bool]) -> None:
+    """Best effort, for rollbacks and disable, the fail-safe path.
+
+    A relay left on LiteLLM still reaches a restored local route through it;
+    the warning names the repair for one left on the local route.
+    """
+    try:
+        _refresh_pixel_model_relay(state)
+    except RuntimeError as exc:
+        logger.warning(
+            "Pixel model relay did not follow the restored model route (%s); "
+            "repair it with: ods restart pixel-model-relay", exc,
+        )
+
+
 def _activate_remote_provider_route(
     route: dict, *, transaction=None, defer_consumer_rollback: bool = False,
 ) -> dict[str, object]:
@@ -5308,6 +5436,7 @@ def _activate_remote_provider_route(
     container_state = _capture_container_state("ods-litellm")
     if not container_state.get("running"):
         raise RuntimeError("LiteLLM must be running before a remote provider can become active")
+    relay_state = _capture_container_state(_PIXEL_MODEL_RELAY_CONTAINER)
 
     existing = _read_remote_provider_activation_state()
     previous = existing.get("previous") if isinstance(existing, dict) else None
@@ -5338,6 +5467,7 @@ def _activate_remote_provider_route(
     pixel_attempted = False
     litellm_recreated = False
     litellm_attempted = False
+    relay_attempted = False
     try:
         _write_remote_provider_activation_state(candidate_state)
         raw_env = str(env_snapshot.get("text") or "")
@@ -5354,6 +5484,10 @@ def _activate_remote_provider_route(
             raise RuntimeError("LiteLLM route could not be recreated")
         _wait_for_container_health("ods-litellm")
         _verify_litellm_route(env, model="ods/current")
+        # Portal reaches the model through the relay, so it must follow
+        # ODS_MODE to LiteLLM before Pixel is bound to the remote model.
+        relay_attempted = True
+        _refresh_pixel_model_relay(relay_state)
         pixel_attempted = pixel_before is not None
         pixel_status = transaction.apply(runtime) if transaction is not None else _reconcile_managed_pixel_contract(runtime)
         activation_public = {
@@ -5392,6 +5526,10 @@ def _activate_remote_provider_route(
             _restore_text_file(activation_public_path, activation_public_snapshot)
         except Exception as rollback_exc:
             rollback_errors.append(f"configuration: {rollback_exc}")
+        # The relay reads only .env, restored above, so it is restored here
+        # even when the lifecycle owner refreshes LiteLLM itself.
+        if relay_attempted:
+            _restore_pixel_model_relay(relay_state)
         # The lifecycle owner must restore its route and credential snapshots
         # before refreshing a consumer that reads those files at startup.
         if litellm_attempted and not defer_consumer_rollback:
@@ -5433,6 +5571,7 @@ def _deactivate_remote_provider_route(*, transaction=None) -> dict[str, object]:
     activation_public_snapshot = _snapshot_text_file(activation_public_path)
     pixel_before = transaction.previous if transaction is not None else _managed_pixel_runtime_contract()
     container_state = _capture_container_state("ods-litellm")
+    relay_state = _capture_container_state(_PIXEL_MODEL_RELAY_CONTAINER)
     owns_transaction = transaction is None
     if owns_transaction:
         transaction = _begin_pixel_model_transaction(load_env(env_path))
@@ -5440,6 +5579,7 @@ def _deactivate_remote_provider_route(*, transaction=None) -> dict[str, object]:
             pixel_before = transaction.previous
     litellm_recreated = False
     litellm_attempted = False
+    relay_attempted = False
     pixel_attempted = False
     try:
         raw_env = str(env_snapshot.get("text") or "")
@@ -5459,6 +5599,10 @@ def _deactivate_remote_provider_route(*, transaction=None) -> dict[str, object]:
         _wait_for_container_health("ods-litellm")
         restored_env = load_env(env_path)
         _verify_litellm_route(restored_env, model="ods/current")
+        # Send Portal's relay back to the restored mode's route as well. Best
+        # effort: disable is the fail-safe path and must not fail on the relay.
+        relay_attempted = True
+        _restore_pixel_model_relay(relay_state)
         previous_pixel = previous.get("pixel")
         pixel_attempted = previous_pixel is not None
         if transaction is not None:
@@ -5496,6 +5640,8 @@ def _deactivate_remote_provider_route(*, transaction=None) -> dict[str, object]:
             _restore_text_file(activation_public_path, activation_public_snapshot)
         except Exception as rollback_exc:
             rollback_errors.append(f"configuration: {rollback_exc}")
+        if relay_attempted:
+            _restore_pixel_model_relay(relay_state)
         if litellm_attempted:
             try:
                 _restore_container_state("ods-litellm", container_state, recreate=True)
@@ -7258,19 +7404,20 @@ def validate_core_recreate_ids(service_ids: list[str]) -> tuple[bool, str]:
     return True, ""
 
 
-def _core_recreate_compose_flags(flags: list[str]) -> list[str]:
+def _core_recreate_compose_flags(flags: list[str], services: tuple[str, ...] | list[str] = ()) -> list[str]:
     """Exclude unrelated extension fragments before Compose interpolates them.
 
     Preserve core overlays and whole extension fragment groups that contribute
-    to core services, including their service references. Missing configuration
-    in a selected fragment must still fail; never fill it with dummy secrets.
+    to core services or to the requested ``services``, including their service
+    references. Missing configuration in a selected fragment must still fail;
+    never fill it with dummy secrets.
     """
     import yaml
 
     roots = (EXTENSIONS_DIR.resolve(), USER_EXTENSIONS_DIR.resolve())
     groups = {}
     file_groups = {}
-    needed = set(CORE_SERVICE_IDS)
+    needed = set(CORE_SERVICE_IDS) | set(services)
     for index, flag in enumerate(flags[:-1]):
         if flag != "-f":
             continue
@@ -7342,13 +7489,18 @@ def docker_compose_converge(service_ids: list[str]) -> tuple:
 
 
 def docker_compose_recreate(service_ids: list[str], *, force_recreate: bool = True) -> tuple:
-    """Force-recreate a set of allowed core services using the current compose stack."""
-    ok, error = validate_core_recreate_ids(service_ids)
-    if not ok:
-        return False, error
+    """Force-recreate a set of allowed core services using the current compose stack.
+
+    Pixel's model relay is no core service, but this agent recreates it on
+    its own when a remote-provider route change rewrites ODS_MODE.
+    """
+    if service_ids != [_PIXEL_MODEL_RELAY_CONTAINER.removeprefix("ods-")]:
+        ok, error = validate_core_recreate_ids(service_ids)
+        if not ok:
+            return False, error
 
     try:
-        flags = _core_recreate_compose_flags(resolve_compose_flags())
+        flags = _core_recreate_compose_flags(resolve_compose_flags(), service_ids)
     except (OSError, ValueError) as exc:
         return False, f"Could not resolve core Compose fragments: {exc}"
     cmd = (
@@ -7357,7 +7509,10 @@ def docker_compose_recreate(service_ids: list[str], *, force_recreate: bool = Tr
         + service_ids
     )
     compose_env = os.environ.copy()
-    for key in ("GGUF_FILE", "LLM_MODEL", "MAX_CONTEXT", "CTX_SIZE"):
+    # Compose prefers the caller's environment to .env. An agent started from
+    # a shell exported .env at that time, and a route change has since
+    # rewritten the route keys (remote-provider activation).
+    for key in ("GGUF_FILE", "LLM_MODEL", "MAX_CONTEXT", "CTX_SIZE", "ODS_MODE", "LLM_API_URL", "EXTERNAL_LLM_URL"):
         compose_env.pop(key, None)
     if "open-webui" in service_ids and _network_auth_required(load_env(INSTALL_DIR / ".env")):
         compose_env["WEBUI_AUTH"] = "true"
@@ -7960,6 +8115,60 @@ def _save_install_operation(value):
     finally:
         if os.path.exists(temporary):
             os.unlink(temporary)
+
+
+def _observe_install_container(service_id):
+    """Return 'running', 'stopped', or None when the outcome is not provable."""
+    ext_dir = _find_ext_dir(service_id)
+    manifest = _read_manifest(ext_dir) if ext_dir is not None else None
+    service_def = manifest.get('service', {}) if isinstance(manifest, dict) else {}
+    if not isinstance(service_def, dict):
+        service_def = {}
+    container = service_def.get('container_name') or f'ods-{service_id}'
+    try:
+        if not _container_exists(container):
+            return 'stopped'
+        result = subprocess.run(
+            ['docker', 'inspect', '--type', 'container', '--format',
+             '{{.State.Status}}|{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}',
+             container],
+            capture_output=True, text=True, timeout=15,
+        )
+    except (RuntimeError, OSError, subprocess.TimeoutExpired):
+        logger.warning('Could not observe %s while reconciling an install', container)
+        return None
+    if result.returncode != 0:
+        return None
+    status, _, health = result.stdout.strip().partition('|')
+    if status == 'running' and health in {'healthy', 'none'}:
+        return 'running'
+    if status in {'exited', 'created', 'dead'}:
+        return 'stopped'
+    return None
+
+
+def _reconcile_install_operation(service_id, operation_id):
+    """Resolve an orphaned non-terminal receipt from observed container state.
+
+    Returns the terminal state written, or None when the receipt must keep
+    blocking (live worker, or container state cannot be proven).
+    """
+    with _install_operation_guard:
+        if (service_id, operation_id) in _install_operation_live:
+            return None
+    observed = _observe_install_container(service_id)
+    if observed is None:
+        return None
+    path = _install_operation_path(service_id, operation_id)
+    value = json.loads(path.read_text(encoding='utf-8'))
+    state = 'succeeded' if observed == 'running' else 'failed'
+    value = {**value, 'state': state, 'phase': 'reconciled', 'updated_at': _iso_now(),
+             'exit_verified': False,
+             'reconciliation': ('reconciled after interruption: container running'
+                                if state == 'succeeded' else
+                                'interrupted: container absent or not running')}
+    _save_install_operation(value)
+    return state
 
 
 def _record_install_operation_progress(service_id, status, phase_label, exit_verified):
@@ -11281,14 +11490,14 @@ class AgentHandler(BaseHTTPRequestHandler):
         lock_acquired = False
         try:
             plan = _plan_remote_provider_lifecycle_operation(body)
-            if not _model_activate_lock.acquire(blocking=False):
+            lock_acquired, _active = _begin_model_lifecycle("remote_provider_apply")
+            if not lock_acquired:
                 json_response(
                     self,
                     409,
                     {"error": "A model or remote-provider activation is already in progress"},
                 )
                 return
-            lock_acquired = True
             result = _apply_remote_provider_lifecycle_operation(body, plan)
         except (_RemoteProviderLifecycleError, _RemoteProviderPolicyError) as exc:
             json_response(self, 400, {"error": str(exc)})
@@ -11313,7 +11522,7 @@ class AgentHandler(BaseHTTPRequestHandler):
             return
         finally:
             if lock_acquired:
-                _model_activate_lock.release()
+                _end_model_lifecycle("remote_provider_apply")
         json_response(self, 200, result)
 
     def _handle_remote_provider_proof(self):
@@ -11325,17 +11534,26 @@ class AgentHandler(BaseHTTPRequestHandler):
             return
         lock_acquired = False
         try:
-            if not _model_activate_lock.acquire(blocking=False):
+            lock_acquired, _active = _begin_model_lifecycle("remote_provider_proof")
+            if not lock_acquired:
                 json_response(
                     self,
                     409,
                     {"error": "A model or remote-provider activation is already in progress"},
                 )
                 return
-            lock_acquired = True
             result = _record_remote_provider_egress_probe(body)
         except ValueError as exc:
             json_response(self, 400, {"error": str(exc)})
+            return
+        except _RemoteProviderNotServing as exc:
+            # Not a busy lifecycle (409): the provider failed; nothing changed.
+            json_response(self, 502, {
+                "error": str(exc),
+                "code": "provider_not_serving",
+                "providerStatus": exc.provider_status,
+                "providerMessage": exc.provider_message,
+            })
             return
         except RuntimeError as exc:
             json_response(self, 409, {"error": str(exc)})
@@ -11346,7 +11564,7 @@ class AgentHandler(BaseHTTPRequestHandler):
             return
         finally:
             if lock_acquired:
-                _model_activate_lock.release()
+                _end_model_lifecycle("remote_provider_proof")
         json_response(self, 200, result)
 
     def _handle_remote_provider_ssh_supervisor_status(self):
@@ -12831,9 +13049,18 @@ class AgentHandler(BaseHTTPRequestHandler):
             for saved in directory.glob('*.json'):
                 older = _read_install_operation(service_id, saved.stem)
                 if older and older['state'] not in {'succeeded', 'failed'}:
+                    # An orphaned receipt (no live worker) is resolved from
+                    # the container's observed state; a live worker or an
+                    # unprovable state keeps blocking.
+                    if _reconcile_install_operation(service_id, saved.stem):
+                        continue
                     lock.release()
                     json_response(self, 409, {'error': 'Previous installation requires reconciliation',
-                                             'operation_id': saved.stem})
+                                             'operation_id': saved.stem,
+                                             'receipt': str(saved),
+                                             'resolution': ('Wait for the running install to finish, or '
+                                                            'confirm the container state and delete this '
+                                                            'receipt file to allow a new install')})
                     return
             operation = {'schema_version': 1, 'service_id': service_id,
                          'operation_id': operation_id, 'run_setup_hook': run_setup_hook,
@@ -13032,6 +13259,11 @@ class AgentHandler(BaseHTTPRequestHandler):
                 logger.exception("Install failed for %s", service_id)
                 _write_progress(service_id, "error", "Installation failed",
                                 error=str(exc)[:500])
+            except Exception as exc:
+                # Never leave the receipt non-terminal; then let it crash.
+                _write_progress(service_id, "error", "Installation failed",
+                                error=f"unexpected error: {exc}"[:500])
+                raise
             finally:
                 _install_operation_context.value = None
                 with _install_operation_guard:
@@ -13043,6 +13275,8 @@ class AgentHandler(BaseHTTPRequestHandler):
         except Exception:
             with _install_operation_guard:
                 _install_operation_live.discard((service_id, operation_id))
+            _save_install_operation({**operation, 'state': 'failed', 'phase': 'error',
+                                     'updated_at': _iso_now()})
             lock.release()
             raise
         # A disconnected observer must not cancel or replay an accepted worker.
@@ -15379,6 +15613,9 @@ class AgentHandler(BaseHTTPRequestHandler):
                         _pixel_image_input_readback(_pixel_model_image_input(model_id), final_runtime_proof),
                         profile_traits),
                 }
+                measured_control = (profile_traits or {}).get('control')
+                if measured_control in ('enable_thinking', 'always', 'none'):
+                    pixel_target['thinkingControl'] = measured_control
                 pixel_status = (pixel_transaction.apply(pixel_target) if pixel_transaction is not None
                     else _reconcile_ods_managed_pixel_model(
                         pixel_runtime_identity, int(context_length),
@@ -19533,6 +19770,103 @@ def _verify_litellm_route(env: dict, *, model: str = "default") -> None:
     )
 
 
+# A provider error that LiteLLM passes on can name the end of a refused key,
+# the key's hash or a rate-limited key's hash (pixel-model-relay/relay.py);
+# none may leave the agent.
+_PROVIDER_KEY_ECHO = (
+    (re.compile(r"(Received API Key\s*=\s*)[^,\s\"\\]+", re.IGNORECASE), r"\1[redacted]"),
+    (re.compile(r"(Key Hash \(Token\)\s*=\s*)[0-9A-Fa-f]+", re.IGNORECASE), r"\1[redacted]"),
+    (re.compile(r"(api_key\s*[:=]\s*)[^\s,\"']+", re.IGNORECASE), r"\1[redacted]"),
+    (re.compile(r"\bsk-[A-Za-z0-9_-]{6,}"), "[redacted]"),
+    (re.compile(r"\b[0-9A-Fa-f]{32,}\b"), "[redacted]"),
+)
+# LiteLLM's wrapper around a provider error, e.g. "litellm.InternalServerError:
+# InternalServerError: OpenAIException - Connection error."
+_LITELLM_ERROR_PREFIX = re.compile(r"^(?:litellm\.\w+:\s*)?(?:\w+Error:\s*)?(?:\w+Exception\s*-\s*)?")
+# LiteLLM got no HTTP answer from its own next hop (the egress): not the API.
+_LITELLM_OWN_FAULT = re.compile(r"^litellm\.APIConnectionError\b")
+
+
+def _provider_error_line(body: str) -> str:
+    """The first line of an error body's message, as LiteLLM wrote it."""
+    try:
+        value = json.loads(body)
+    except json.JSONDecodeError:
+        value = None
+    error = value.get("error") if isinstance(value, dict) else None
+    text = str((error.get("message") if isinstance(error, dict) else error if isinstance(error, str) else body) or "")
+    return text.strip().splitlines()[0] if text.strip() else ""
+
+
+def _provider_error_text(line: str) -> str:
+    """That line bounded, without key echoes, control characters or backslashes."""
+    for pattern, replacement in _PROVIDER_KEY_ECHO:
+        line = pattern.sub(replacement, line)
+    line = "".join(character for character in line if character.isprintable() and character != "\\")
+    return _LITELLM_ERROR_PREFIX.sub("", line).strip()[:300]
+
+
+def _litellm_ready(host: str, port: str) -> bool:
+    """LiteLLM's own readiness, which needs no provider answer."""
+    try:
+        result = subprocess.run(
+            ["curl", "-s", "-o", "/dev/null", "--max-time", "5", "-w", "%{http_code}",
+             f"http://{host}:{port}/health/readiness"],
+            capture_output=True, encoding="utf-8", errors="replace", timeout=10,
+        )
+    except subprocess.TimeoutExpired:
+        return False
+    return result.returncode == 0 and result.stdout.strip() == "200"
+
+
+def _litellm_route_failure(env: dict, *, model: str = "ods/current") -> tuple[int | None, str, bool] | None:
+    """Ask the active LiteLLM route for one completion.
+
+    Returns None when it answers. Otherwise returns the HTTP status (None when
+    LiteLLM itself did not answer), a bounded error text, and whether the
+    failure is the provider's, meaning LiteLLM and its egress hop worked.
+    """
+    host = "ods-litellm" if os.environ.get("ODS_HOST_INSTALL_DIR") else "127.0.0.1"
+    port = str(env.get("LITELLM_PORT") or "4000")
+    api_key = str(env.get("LITELLM_KEY") or env.get("LITELLM_MASTER_KEY") or "")
+    command = [
+        "curl", "-s", "--max-time", "30", "--max-filesize", "65536",
+        "-w", "\n%{http_code}", "-X", "POST", f"http://{host}:{port}/v1/chat/completions",
+        "-H", "Content-Type: application/json", "-H", "@-",
+        "-d", json.dumps(_completion_probe_payload(model, disable_thinking=False)),
+    ]
+    try:
+        result = subprocess.run(
+            command, capture_output=True, encoding="utf-8", errors="replace", timeout=35,
+            # Keep the key out of process listings (see _chat_completion_ready).
+            input=f"Authorization: Bearer {api_key}\n",
+        )
+        timed_out = result.returncode == 28
+    except subprocess.TimeoutExpired:
+        timed_out = True
+    if timed_out:
+        # LiteLLM took the request but no answer came: the API's slowness if
+        # LiteLLM itself still answers, else LiteLLM's own fault.
+        if _litellm_ready(host, port):
+            return 504, "The API did not answer within 30 seconds", True
+        return None, "LiteLLM did not answer in time", False
+    body, _, code = result.stdout.rpartition("\n")
+    if result.returncode != 0 or not code.isdigit() or code == "000":
+        return None, "LiteLLM did not answer", False
+    status = int(code)
+    if status == 200:
+        try:
+            response = json.loads(body)
+        except json.JSONDecodeError:
+            return status, "LiteLLM returned an invalid completion", False
+        if _completion_response_ready(response, require_visible_content=False):
+            return None
+        return status, "The API answered with an empty completion", True
+    line = _provider_error_line(body)
+    provider = (status >= 500 or status in {408, 429}) and not _LITELLM_OWN_FAULT.match(line)
+    return status, _provider_error_text(line) or f"HTTP {status}", provider
+
+
 def _read_hermes_container_config() -> str:
     if not _container_running("ods-hermes"):
         raise RuntimeError("Hermes live config is host-inaccessible and ods-hermes is not running")
@@ -21160,6 +21494,328 @@ def _public_docker_client_config(install_dir: Path, environ) -> Path | None:
     return config_dir
 
 
+# `wsl --shutdown`, which ODS's own messages recommend, restarts Docker
+# Desktop's VM, and Docker brings ODS's unless-stopped containers back healthy.
+# Some of their published 127.0.0.1 ports then accept a connection and close
+# it at once, from Windows and from WSL, until that container restarts: Open
+# WebUI, llama-server, LiteLLM, Whisper and Kokoro stayed unreachable this way
+# (fleet test, Docker Desktop 4.68 / Engine 29.3.1, 2026-10-18). Each agent
+# start under WSL checks the healthy ODS HTTP ports once and restarts a
+# container whose port stays dead, at most once per WSL VM boot.
+_WSL_PORT_CHECK_WINDOW_SECONDS = 600  # llama-server can load a model for minutes
+_WSL_PORT_CHECK_MIN_WATCH_SECONDS = 120  # a container Docker starts late still counts
+_WSL_PORT_CHECK_POLL_SECONDS = 15
+_WSL_PORT_CHECK_DEAD_POLLS = 2  # consecutive polls on which a port must be dead
+_WSL_PORT_PROBE_TIMEOUT_SECONDS = 5
+_WSL_PORT_RESTART_TIMEOUT_SECONDS = 120
+_WSL_PORT_CHECK_RECORD = "wsl-port-check.json"
+# Published bindings that 127.0.0.1 reaches: loopback and the IPv4 wildcard.
+_WSL_PORT_LOOPBACK_HOST_IPS = frozenset({"127.0.0.1", "0.0.0.0", ""})
+# States after which this agent start leaves a container alone.
+_WSL_PORT_DONE_STATES = frozenset({
+    "answering", "repaired", "still-dead", "restarted-earlier", "restart-failed", "gone",
+})
+_LINUX_BOOT_ID_RE = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
+
+
+def _linux_boot_id(path: Path = Path("/proc/sys/kernel/random/boot_id")) -> str | None:
+    """Return this kernel boot's id. WSL draws a new one each time its VM starts."""
+    try:
+        value = path.read_text(encoding="utf-8").strip()
+    except OSError:
+        return None
+    return value if _LINUX_BOOT_ID_RE.fullmatch(value) else None
+
+
+def _declared_http_ports() -> dict[str, tuple[str, int]]:
+    """Map declared container names to (service id, in-container HTTP port).
+
+    A manifest ``health`` path marks ``port`` as HTTP. An empty one marks a
+    database or broker port, which an HTTP request cannot judge.
+    """
+    ports = {}
+    for name, service_id in _declared_docker_containers().items():
+        ext_dir = _find_ext_dir(service_id)
+        manifest = _read_manifest(ext_dir) if ext_dir is not None else None
+        service = manifest.get("service") if manifest else None
+        if not isinstance(service, dict):
+            continue
+        port, health = service.get("port"), service.get("health")
+        if type(port) is int and 0 < port < 65536 and isinstance(health, str) and health.strip():
+            ports[name] = (service_id, port)
+    return ports
+
+
+def _running_ods_container_rows() -> list:
+    """Inspect the running containers of the ODS Compose project; [] without an answer."""
+    try:
+        listed = subprocess.run(
+            ["docker", "ps", "--no-trunc", "--quiet", "--filter", "status=running",
+             "--filter", "label=com.docker.compose.project=ods"],
+            capture_output=True, text=True, timeout=10,
+        )
+        if listed.returncode != 0 or not listed.stdout.split():
+            return []
+        inspected = subprocess.run(
+            ["docker", "inspect", "--type", "container", *listed.stdout.split()],
+            capture_output=True, text=True, timeout=15,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        logger.debug("WSL port check: Docker did not answer: %s", exc)
+        return []
+    # A container that stops between the two commands fails the inspect;
+    # the next poll sees the new state.
+    if inspected.returncode != 0:
+        return []
+    rows = json.loads(inspected.stdout)
+    return rows if isinstance(rows, list) else []
+
+
+def _wsl_port_check_targets(rows: list, http_ports: dict, install_dir: Path) -> list[dict]:
+    """Select this installation's running containers whose declared HTTP port
+    is published where 127.0.0.1 reaches it (pure).
+
+    Ownership is the Compose project and its working directory, as in
+    scripts/stop-owned-containers.py: a container name alone can belong to
+    another installation on the same Docker engine.
+    """
+    root = os.path.realpath(install_dir)
+    targets = []
+    for row in rows:
+        labels = (row.get("Config") or {}).get("Labels") or {}
+        state = row.get("State") or {}
+        working_dir = labels.get("com.docker.compose.project.working_dir")
+        name = str(row.get("Name") or "").lstrip("/")
+        container_id = str(row.get("Id") or "")
+        if (labels.get("com.docker.compose.project") != "ods"
+                or not isinstance(working_dir, str) or not os.path.isabs(working_dir)
+                or os.path.realpath(working_dir) != root
+                or name not in http_ports or state.get("Running") is not True
+                or not re.fullmatch(r"[0-9a-f]{64}", container_id)):
+            continue
+        service_id, port = http_ports[name]
+        bindings = ((row.get("NetworkSettings") or {}).get("Ports") or {}).get(f"{port}/tcp") or []
+        host_ports = sorted({
+            int(binding["HostPort"]) for binding in bindings
+            if binding.get("HostIp") in _WSL_PORT_LOOPBACK_HOST_IPS
+            and re.fullmatch(r"[1-9][0-9]{0,4}", str(binding.get("HostPort") or ""))
+            and int(binding["HostPort"]) < 65536
+        })
+        if host_ports:
+            health = (state.get("Health") or {}).get("Status") or "none"
+            targets.append({"id": container_id, "name": name, "service": service_id,
+                            "health": health, "ports": host_ports})
+    return targets
+
+
+def _probe_loopback_http(port: int) -> str:
+    """Send one minimal HTTP request to 127.0.0.1:<port> and classify the reply.
+
+    Any reply byte, whatever the status code, proves the forward works
+    ("answering"). A refused connection, or one closed without a reply, is
+    the dead Docker Desktop forward ("refused", "closed"). A timeout proves
+    nothing either way.
+    """
+    request = f"GET / HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n"
+    try:
+        with socket.create_connection(
+            ("127.0.0.1", port), timeout=_WSL_PORT_PROBE_TIMEOUT_SECONDS,
+        ) as connection:
+            connection.sendall(request.encode("ascii"))
+            reply = connection.recv(64)
+    except ConnectionRefusedError:
+        return "refused"
+    except (ConnectionResetError, ConnectionAbortedError, BrokenPipeError):
+        return "closed"
+    except socket.timeout:
+        return "timeout"
+    return "answering" if reply else "closed"
+
+
+def _wsl_port_verdict(outcomes: list[str]) -> str:
+    """Combine one container's probes (pure): any reply proves its forward works."""
+    if "answering" in outcomes:
+        return "answering"
+    if any(outcome in ("refused", "closed") for outcome in outcomes):
+        return "dead"
+    return "unknown"
+
+
+def _wsl_port_check_decision(state: str, verdict: str, dead_polls: int,
+                             restarted_earlier: bool) -> str | None:
+    """Return a container's next state, "restart", or None to probe again (pure).
+
+    ``dead_polls`` counts consecutive dead verdicts, this one included.
+    """
+    if state == "restarted":
+        return {"answering": "repaired", "dead": "still-dead"}.get(verdict)
+    if verdict == "answering":
+        return "answering"
+    if verdict != "dead" or dead_polls < _WSL_PORT_CHECK_DEAD_POLLS:
+        return None
+    return "restarted-earlier" if restarted_earlier else "restart"
+
+
+def _read_wsl_port_restarts(path: Path, boot_id: str) -> set[str]:
+    """Return the containers already restarted during this WSL boot."""
+    try:
+        record = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return set()
+    except ValueError:
+        logger.warning("WSL port check: ignoring unreadable restart record %s", path)
+        return set()
+    if not isinstance(record, dict) or record.get("bootId") != boot_id:
+        return set()
+    names = record.get("restarted")
+    if not isinstance(names, list) or not all(isinstance(name, str) for name in names):
+        logger.warning("WSL port check: ignoring invalid restart record %s", path)
+        return set()
+    return set(names)
+
+
+def _record_and_restart(target: dict, restarted: set, record_path: Path,
+                        boot_id: str) -> tuple[str, str]:
+    """Record the restart for this boot first, so no crash or later agent
+    start can repeat it, then restart the same container (same model, same
+    settings: a restart, not a recreate)."""
+    restarted.add(target["name"])
+    try:
+        _atomic_write_json(record_path, {"bootId": boot_id, "restarted": sorted(restarted)})
+        result = subprocess.run(
+            ["docker", "restart", target["id"]],
+            capture_output=True, text=True, timeout=_WSL_PORT_RESTART_TIMEOUT_SECONDS,
+        )
+    except (OSError, RuntimeError, subprocess.TimeoutExpired) as exc:
+        return "restart-failed", str(exc)
+    if result.returncode != 0:
+        return "restart-failed", (result.stderr or result.stdout or "").strip()[:300]
+    return "restarted", ""
+
+
+def _restart_dead_port_container(target: dict, restarted: set, record_path: Path,
+                                 boot_id: str) -> tuple[str, str]:
+    """Restart one container whose published port is dead; return (state, detail).
+
+    Like the dashboard's Restart button, this holds the service's lock.
+    llama-server also claims the model lifecycle and waits out a pending
+    Pixel model transaction, so it never races a model switch.
+    """
+    service = target["service"]
+    model_runtime = service == "llama-server"
+    if model_runtime:
+        acquired, active = _begin_model_lifecycle("wsl_port_restart")
+        if not acquired:
+            return "deferred", f"{active.get('operation') or 'a model operation'} is in progress"
+    lock = _service_locks[service]
+    locked = lock.acquire(blocking=False)
+    try:
+        if not locked:
+            return "deferred", "another operation on this service is in progress"
+        if model_runtime and _pixel_model_transition_pending_for_route_proof():
+            return "deferred", "a Pixel model transaction is pending"
+        if not _container_running(target["id"]):
+            return "gone", "it stopped or was replaced before the restart"
+        return _record_and_restart(target, restarted, record_path, boot_id)
+    finally:
+        if locked:
+            lock.release()
+        if model_runtime:
+            _end_model_lifecycle("wsl_port_restart")
+
+
+def _log_wsl_port_state(name: str, state: str, previous: str, detail: str) -> None:
+    if state == "restarted":
+        logger.info("WSL port check: restarted %s because its published port stopped "
+                    "forwarding (%s)", name, detail)
+    elif state == "deferred" and previous != "deferred":
+        logger.info("WSL port check: not restarting %s yet: %s", name, detail)
+    elif state == "gone":
+        logger.info("WSL port check: left %s alone: %s", name, detail)
+    elif state == "restart-failed":
+        logger.warning("WSL port check: could not restart %s: %s", name, detail)
+    elif state == "still-dead":
+        logger.warning("WSL port check: %s still has a dead port after one restart; "
+                       "not restarting it again during this WSL boot", name)
+    elif state == "restarted-earlier":
+        logger.info("WSL port check: %s has a dead port but was restarted once during "
+                    "this WSL boot already; leaving it", name)
+
+
+def _wsl_port_check_step(target: dict, states: dict, dead_polls: dict, restarted: set,
+                         record_path: Path, boot_id: str) -> None:
+    """Probe one container that Docker reports healthy and act on the result."""
+    name = target["name"]
+    state = states.setdefault(name, "waiting")
+    # Healthy means the service answers inside its container, so a dead
+    # published port is the forward, not a service that is still starting.
+    if state in _WSL_PORT_DONE_STATES or target["health"] != "healthy":
+        return
+    outcomes = [_probe_loopback_http(port) for port in target["ports"]]
+    verdict = _wsl_port_verdict(outcomes)
+    dead_polls[name] = dead_polls.get(name, 0) + 1 if verdict == "dead" else 0
+    decision = _wsl_port_check_decision(state, verdict, dead_polls[name], name in restarted)
+    if decision is None:
+        return
+    detail = ", ".join(f"127.0.0.1:{port} {outcome}"
+                       for port, outcome in zip(target["ports"], outcomes))
+    if decision == "restart":
+        decision, failure = _restart_dead_port_container(target, restarted, record_path, boot_id)
+        detail = failure or detail
+    _log_wsl_port_state(name, decision, state, detail)
+    states[name] = decision
+
+
+def _wsl_port_check(boot_id: str, record_path: Path, *, clock=time.monotonic,
+                    sleep=time.sleep) -> dict[str, str]:
+    """Watch ODS's published HTTP ports after a WSL VM boot, within a bound.
+
+    Returns each container's state; "waiting" never became healthy in time.
+    """
+    restarted = _read_wsl_port_restarts(record_path, boot_id)
+    states: dict[str, str] = {}
+    dead_polls: dict[str, int] = {}
+    started = clock()
+    while True:
+        rows = _running_ods_container_rows()
+        targets = _wsl_port_check_targets(rows, _declared_http_ports(), INSTALL_DIR) if rows else []
+        for target in targets:
+            _wsl_port_check_step(target, states, dead_polls, restarted, record_path, boot_id)
+        elapsed = clock() - started
+        settled = bool(targets) and all(states[t["name"]] in _WSL_PORT_DONE_STATES for t in targets)
+        if elapsed >= _WSL_PORT_CHECK_WINDOW_SECONDS or (
+            settled and elapsed >= _WSL_PORT_CHECK_MIN_WATCH_SECONDS
+        ):
+            return states
+        sleep(_WSL_PORT_CHECK_POLL_SECONDS)
+
+
+def _run_wsl_port_check() -> None:
+    """Thread body: one bounded check per agent start, summarized in one line."""
+    boot_id = _linux_boot_id()
+    if boot_id is None:
+        logger.warning("WSL port check skipped: no boot id to limit restarts to one per WSL boot")
+        return
+    logger.info("WSL port check: watching ODS's published HTTP ports for up to %d minutes",
+                _WSL_PORT_CHECK_WINDOW_SECONDS // 60)
+    states = _wsl_port_check(boot_id, DATA_DIR / _WSL_PORT_CHECK_RECORD)
+    by_state: dict[str, list[str]] = {}
+    for name, state in sorted(states.items()):
+        by_state.setdefault(state, []).append(name)
+    summary = "; ".join(f"{state} {', '.join(names)}" for state, names in sorted(by_state.items()))
+    logger.info("WSL port check finished: %s", summary or "no running ODS HTTP service")
+
+
+def _start_wsl_port_check() -> threading.Thread | None:
+    """Start the check in the background under WSL; the agent never waits on it."""
+    # An agent inside a container would probe that container's own loopback.
+    if not _is_wsl_linux() or os.environ.get("ODS_HOST_INSTALL_DIR"):
+        return None
+    thread = threading.Thread(target=_run_wsl_port_check, name="ods-wsl-port-check", daemon=True)
+    thread.start()
+    return thread
+
+
 def main():
     global INSTALL_DIR, DATA_DIR, AGENT_API_KEY, GPU_BACKEND, STARTUP_ODS_MODE
     global TIER, GPU_COUNT, CORE_SERVICE_IDS
@@ -21283,6 +21939,7 @@ def main():
         if platform.system() in ('Darwin', 'Linux'):
             threading.Thread(target=_monitor_native_pixel_access,
                              name='ods-pixel-startup-reproof', daemon=True).start()
+        _start_wsl_port_check()
         server.serve_forever()
     except KeyboardInterrupt:
         logger.info("Shutting down")

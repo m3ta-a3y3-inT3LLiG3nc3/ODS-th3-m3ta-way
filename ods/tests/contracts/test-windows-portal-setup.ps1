@@ -115,10 +115,12 @@ function Reset-Scenario {
     $script:amdBinding = @()
     $script:distroListFailure = $null
     $script:initProbes = @()
+    $script:wslRegistrations = @([pscustomobject]@{ DistributionName='Ubuntu-24.04'; BasePath='C:\Users\maria\AppData\Local\wsl\{4c1b6a3e}' })
 }
 function Test-ODSPortalVirtualization { $script:calls.Add('virt-check'); return $script:virtualization }
 function Test-ODSSparkWindowsArm64 { $script:calls.Add('arm64-check'); return $script:arm64 }
 function Get-ODSPortalFreeSystemGB { return $script:freeGB }
+function Get-ODSPortalWslRegistrations { return $script:wslRegistrations }
 function Get-ODSPortalDockerDesktop { return [pscustomobject]@{ Installed=$script:dockerInstalled; Exe='docker-desktop.exe'; Cli='docker.exe' } }
 function Install-ODSPortalDockerDesktop {
     $script:calls.Add('docker-install'); $script:dockerInstalled = $true
@@ -271,6 +273,16 @@ try {
     Reset-Scenario
     $null = Invoke-ODSPortalSetup @{NoHermes=$true} 'unused'
     Check ($script:capturedArguments -contains '--no-hermes') '-NoHermes turns Hermes off on a rerun too'
+    # The Windows drive under the distribution's virtual disk reaches the
+    # Linux installer, so ODS can check that drive before model downloads.
+    Reset-Scenario
+    $script:wslRegistrations = @([pscustomobject]@{ DistributionName='Ubuntu-24.04'; BasePath='\\?\D:\WSL\Ubuntu-24.04' })
+    Check ((Invoke-ODSPortalSetup @{} 'unused') -eq 0) 'a distribution stored on drive D: installs'
+    Check ((@($script:capturedArguments)[0..1] -join ' ') -ceq '--wsl-disk-drive D:' -and $script:capturedArguments[-1] -ceq '--pixel') 'the drive that stores the distribution reaches the Linux installer ahead of the Pixel policy'
+    Reset-Scenario
+    $script:wslRegistrations = @()
+    $driveNotice = @(& { $script:noDriveResult = Invoke-ODSPortalSetup @{} 'unused' } 6>&1 | ForEach-Object { [string]$_ }) -join "`n"
+    Check ($script:noDriveResult -eq 0 -and $script:capturedArguments -notcontains '--wsl-disk-drive' -and $driveNotice -match 'Could not find the Windows drive that stores Ubuntu-24\.04') 'an unknown storage drive is said, and no drive flag is passed'
     # windows.ps1 owns the new-installation probe (no <root>/.env before
     # install-core). Run its real flag block for a new installation and a rerun.
     $windowsAst = [System.Management.Automation.Language.Parser]::ParseFile((Join-Path $PSScriptRoot '../../installers/windows.ps1'), [ref]$null, [ref]$null)

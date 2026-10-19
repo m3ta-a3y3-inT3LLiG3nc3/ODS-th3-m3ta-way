@@ -420,9 +420,9 @@ else
                 _phase06_pixel_source_transition=0
                 # The pending plan is bound to the tree it recorded. Keep the
                 # retired service files: `stage` below either resumes this
-                # release's own plan, which pruned them before staging, or
-                # refuses an older plan so the release that staged it can
-                # still finish or roll it back.
+                # release's own plan, or archives an older untouched unheld
+                # plan after verifying its exact baseline. Held plans retain
+                # their source so that release can finish or roll them back.
                 _phase06_prune_ready=false
             fi
             unset _phase06_source_status
@@ -954,6 +954,7 @@ SERVICE_PORT_DEFAULTS
     LITELLM_KEY=$(_phase06_env_hex_secret LITELLM_KEY 16 "sk-ods-")
     ODS_WINDOWS_SYSTEM_DIRECTORY="$(_env_get_explicit_first ODS_WINDOWS_SYSTEM_DIRECTORY '')"
     ODS_WSL_STATE_ROOT="$(_env_get_explicit_first ODS_WSL_STATE_ROOT '')"
+    ODS_WSL_DISK_DRIVE="$(_env_get_explicit_first ODS_WSL_DISK_DRIVE '')"
     # Host-native llama-server (Windows Portal): the in-stack llama-server is
     # off, and LiteLLM and model-router reach the native server with
     # LLAMA_SERVER_API_KEY. install-core.sh validated the flags.
@@ -1594,6 +1595,7 @@ NATIVE_LLM_CONTAINER_BASE_URL=$(dotenv_value "${NATIVE_LLM_CONTAINER_BASE_URL_VA
 $(if [[ -n "$LLAMA_SERVER_API_KEY_VALUE" ]]; then printf 'LLAMA_SERVER_API_KEY=%s' "$(dotenv_value "$LLAMA_SERVER_API_KEY_VALUE")"; fi)
 $(if [[ -n "${ODS_WINDOWS_SYSTEM_DIRECTORY}" ]]; then printf 'ODS_WINDOWS_SYSTEM_DIRECTORY=%s' "$(dotenv_value "$ODS_WINDOWS_SYSTEM_DIRECTORY")"; fi)
 $(if [[ -n "${ODS_WSL_STATE_ROOT}" ]]; then printf 'ODS_WSL_STATE_ROOT=%s' "$(dotenv_value "$ODS_WSL_STATE_ROOT")"; fi)
+$(if [[ -n "${ODS_WSL_DISK_DRIVE}" ]]; then printf 'ODS_WSL_DISK_DRIVE=%s' "$(dotenv_value "$ODS_WSL_DISK_DRIVE")"; fi)
 
 #=== Cloud API Keys ===
 ANTHROPIC_API_KEY=$(dotenv_value "${ANTHROPIC_API_KEY:-}")
@@ -1658,6 +1660,12 @@ $(if [[ -n "${LLAMA_ARG_SPEC_TYPE:-}" ]]; then echo "LLAMA_ARG_SPEC_TYPE=${LLAMA
 $(if [[ -n "${LLAMA_ARG_SPEC_DRAFT_N_MAX:-}" ]]; then echo "LLAMA_ARG_SPEC_DRAFT_N_MAX=${LLAMA_ARG_SPEC_DRAFT_N_MAX}"; fi)
 $(if [[ -n "${LLAMA_ARG_SPEC_DRAFT_TYPE_K:-}" ]]; then echo "LLAMA_ARG_SPEC_DRAFT_TYPE_K=${LLAMA_ARG_SPEC_DRAFT_TYPE_K}"; fi)
 $(if [[ -n "${LLAMA_ARG_SPEC_DRAFT_TYPE_V:-}" ]]; then echo "LLAMA_ARG_SPEC_DRAFT_TYPE_V=${LLAMA_ARG_SPEC_DRAFT_TYPE_V}"; fi)
+# Model activation sets these for the active model only: an imported model's
+# vision projector and a fixed chat template. A rerun keeps them only for the
+# same model (scripts/preserve-active-model.py).
+$(if [[ -n "${LLAMA_ARG_MMPROJ:-}" ]]; then echo "LLAMA_ARG_MMPROJ=$(dotenv_value "$LLAMA_ARG_MMPROJ")"; fi)
+$(if [[ -n "${MODEL_CHAT_TEMPLATE_OVERRIDE:-}" ]]; then echo "MODEL_CHAT_TEMPLATE_OVERRIDE=$(dotenv_value "$MODEL_CHAT_TEMPLATE_OVERRIDE")"; fi)
+$(if [[ -n "${LLAMA_ARG_CHAT_TEMPLATE_FILE:-}" ]]; then echo "LLAMA_ARG_CHAT_TEMPLATE_FILE=$(dotenv_value "$LLAMA_ARG_CHAT_TEMPLATE_FILE")"; fi)
 LLAMA_CPU_LIMIT=${LLAMA_CPU_LIMIT}
 LLAMA_CPU_RESERVATION=${LLAMA_CPU_RESERVATION}
 

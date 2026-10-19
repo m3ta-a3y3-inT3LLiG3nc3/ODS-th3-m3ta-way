@@ -102,10 +102,12 @@ else:
             # "supported" holds only while llama-server loads the model's
             # vision projector, which only a Models-page switch proves
             # (/props modalities.vision). The installer runs this renderer
-            # after it rewrites .env from its template, which has no
-            # LLAMA_ARG_MMPROJ (installers/phases/06-directories.sh), so the
-            # same model can now run without its projector. Fall back to
-            # "unknown" until the next switch reads the projector back.
+            # after it rewrites .env, and that rewrite keeps LLAMA_ARG_MMPROJ
+            # only while the same model's projector file still checks out
+            # (scripts/preserve-active-model.py), so the same model can now
+            # run without its projector. This renderer cannot see which
+            # happened: fall back to "unknown" until the next switch reads
+            # the projector back.
             image_input = "unknown" if previous_image_input == "supported" else previous_image_input
             thinking_control = previous_thinking_control
         if route_fingerprint is not None and (not isinstance(route_fingerprint, str)

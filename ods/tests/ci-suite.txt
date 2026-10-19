@@ -98,6 +98,8 @@ tests/test-llama-image-compute-cap.sh
 tests/test-llama-memory-budget.sh
 tests/test-llama-mtp-args.sh
 tests/test-llm-cold-storage-arithmetic.py
+tests/test_cold_storage_initial_directory.py
+tests/test-cold-storage-recovery.py
 tests/test-local-app-auth-defaults.sh
 tests/test-locale-safe-cpu-formatting.sh
 tests/test-macos-agent-python.sh
@@ -142,6 +144,7 @@ tests/test-ods-doctor-install-diagnoses.sh
 tests/test-help-links.sh
 tests/test-macos-api-mode-flags.sh
 tests/test-install-failure-message.sh
+tests/test-release-gate-syntax.sh
 tests/test-remote-provider-cli-output.sh
 tests/test-doctor-fresh-report.sh
 tests/test-model-recover-cli.sh

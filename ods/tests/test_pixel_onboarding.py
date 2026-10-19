@@ -100,10 +100,10 @@ def test_a_vision_claim_is_never_carried_through_a_render(contract):
 
 def test_installer_rerun_after_a_vision_switch_waits_for_the_next_readback(contract):
     # A Models-page switch declared "supported" from llama-server's /props
-    # readback. Rerunning the installer (how ODS updates) keeps the model but
-    # rewrites .env without LLAMA_ARG_MMPROJ, so the model may now run
-    # without its projector. The rerun must not keep the claim; the next
-    # switch reads the projector back.
+    # readback. Rerunning the installer (how ODS updates) keeps the model, and
+    # keeps LLAMA_ARG_MMPROJ only while its projector file still checks out,
+    # so the model may now run without its projector. The rerun must not keep
+    # the claim; the next switch reads the projector back.
     answers, args = contract
     assert render(args).returncode == 0
     switch = '''

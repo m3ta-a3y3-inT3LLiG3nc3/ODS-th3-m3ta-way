@@ -642,10 +642,11 @@ Remote routes are written as `unknown` and never read a local report.
 An installation that already runs a vision model gets the readback on its
 next model switch. Every installer run, including an update, writes
 `unknown` over a `supported` declaration (`installers/lib/pixel-onboarding.py`):
-the installer rewrites `.env` without `LLAMA_ARG_MMPROJ` while keeping the
-active model, so the model may now run without its projector. `unsupported`
-and `unknown` carry over for the same route; the next switch reads the
-projector back.
+the installer keeps the active model and keeps `LLAMA_ARG_MMPROJ` only while
+that model's projector file still checks out (`scripts/preserve-active-model.py`),
+so the model may now run without its projector, and the renderer cannot see
+which happened. `unsupported` and `unknown` carry over for the same route; the
+next switch reads the projector back.
 
 **The directive.** When the gate is open and the run guard grants one of the
 run's at most three screenshots (`tool-loop-guard.mjs`

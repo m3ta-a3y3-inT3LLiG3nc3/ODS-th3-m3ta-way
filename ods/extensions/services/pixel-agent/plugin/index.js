@@ -385,6 +385,10 @@ export default definePluginEntry({
       warn: (message) => api.logger.warn(message),
       info: (message) => api.logger.info?.(message),
       exampleOwnerRun: context => delegationDelivery.ownerRunOf(context),
+      // Only a remote API route carries a route fingerprint
+      // (model-runtime-readback.mjs); its output limit is the owner's setting.
+      remoteModelRoute: () => typeof (api.runtime?.config?.current?.() ?? api.config)
+        ?.plugins?.entries?.['pixel-ods']?.config?.modelRouteFingerprint === 'string',
     });
     const bundleExecution = createWorkspaceBundleExecution({
       readConfig: () => api.runtime?.config?.current?.() ?? api.config,
@@ -614,9 +618,11 @@ export default definePluginEntry({
       return message !== original ? {...decision, message} : decision;
     });
     // Observation only (never blocks or rewrites): after a tool-limit stop the
-    // answer turn's message can carry partial-answer text with its tool calls.
+    // answer turn's message can carry partial-answer text with its tool calls,
+    // and the last reply's stop reason shows an output-limit cut.
     api.on("before_message_write", (event, context) => {
       toolLoopGuard.observeAssistantMessage(event, context, AGENT_ID);
+      toolLoopGuard.observeReplyEnd(event, context, AGENT_ID);
     });
     api.on("before_agent_finalize", async (event, context) => {
       await toolLoopGuard.revalidateWorkspacePreview(event, context, AGENT_ID);

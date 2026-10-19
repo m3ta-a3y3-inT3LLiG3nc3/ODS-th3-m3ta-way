@@ -214,6 +214,16 @@ def _path(path: str, direction: str) -> str:
     return value
 
 
+def drive_mount(drive: str) -> Path:
+    """Where this distribution mounts a Windows drive such as ``C:``.
+
+    wslpath honours a custom DrvFS mount root ([automount] root in wsl.conf).
+    """
+    if not isinstance(drive, str) or not re.fullmatch(r"[A-Za-z]:", drive):
+        raise ValueError("A Windows drive letter such as C: is required")
+    return Path(_path(drive + "\\", "-u"))
+
+
 def _windows_tools(env: dict) -> _WindowsTools:
     system = env.get('ODS_WINDOWS_SYSTEM_DIRECTORY', '')
     if not system:

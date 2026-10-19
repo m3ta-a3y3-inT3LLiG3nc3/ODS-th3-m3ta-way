@@ -64,6 +64,28 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
     network-problem message.
 
 ### Fixed
+- On Windows, a model download no longer trusts the free space that WSL's
+  virtual disk reports. That disk grows into the Windows drive that stores it,
+  up to about 1 TB, so the Hugging Face file picker offered 836 GiB while
+  drive C: had 68.8 GB free, and a large download could fill the drive that
+  Windows and WSL need. Windows setup now records the drive that stores the
+  Ubuntu distribution (`ODS_WSL_DISK_DRIVE`), and the download check counts no
+  more free space than that drive has and keeps 5% of its size (at least
+  2 GiB) free. The file picker names the drive, or says when it could not
+  check it. Existing Windows installs get the check on their next
+  `install.ps1` run; Linux and macOS are unchanged.
+- Updating ODS (rerunning the installer) no longer takes a vision model's
+  projector away. The installer kept an imported vision model active but
+  rewrote `.env` without `LLAMA_ARG_MMPROJ`, so llama-server answered every
+  image with HTTP 500 ("image input is not supported"). A rerun now keeps the
+  projector for the same model while its file is still a regular file beside
+  the weights at the size the import recorded, and keeps a fixed chat template
+  (`MODEL_CHAT_TEMPLATE_OVERRIDE` with `LLAMA_ARG_CHAT_TEMPLATE_FILE`) while
+  this release still ships it unchanged. Another model, `--reselect-model` and
+  any other value get neither. Portal still asks before sending images after an
+  update until the next Models-page switch reads the projector back. An
+  installation an earlier update already left without its projector gets it
+  back by switching to the model again on the Models page.
 - On an NVIDIA GPU of compute capability 12.1, the DGX Spark GB10 and the RTX
   Spark N1X, the model no longer answers with question marks. llama.cpp's CUDA
   12 container images, the default among them, have no kernels for that GPU;
@@ -280,6 +302,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   a long line of spaces.
 
 ### Changed
+- Elf of Doom gives more arrows: slain enemies drop a 6-arrow quiver 20% of
+  the time (was 18% for 3), and the timed supply drop gives 12 arrows every
+  20 seconds (was 6), so boss-fight reinforcements no longer outrun the arrow
+  supply. Portal made the change from the owner's prompts; the game files
+  stay exactly the ones https://odsspark.com/game/ serves.
+- Elf of Doom's wolves, the pack hounds and the wolf boss Skarnax, move 15%
+  slower: players kept stalling in the wolf realm because of their speed.
+  Portal made the change from one owner prompt, and the game files are again
+  exactly the ones https://odsspark.com/game/ serves. An install that already
+  has `Playground/elf-of-doom` keeps its own copy.
 - The unsupported Tauri desktop installer under `installer/` is removed. No CI
   built it and no release shipped it, and its installer arguments no longer
   matched the current installers. Its build dependencies carried the

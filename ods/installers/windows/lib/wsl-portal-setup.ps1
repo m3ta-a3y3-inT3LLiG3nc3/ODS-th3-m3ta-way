@@ -507,6 +507,14 @@ function Invoke-ODSPortalSetup([System.Collections.IDictionary]$Options, [string
             $windowsModelRoute = $forwardEnvironment.Count -gt 0
         }
     }
+    # Ubuntu sees its virtual disk's growth limit, not the Windows drive that
+    # stores the disk; ODS checks that drive before model downloads.
+    $wslDiskDrive = Get-ODSPortalDistroDrive $distro
+    if ($wslDiskDrive) {
+        $linuxArgs = @('--wsl-disk-drive', $wslDiskDrive) + $linuxArgs
+    } else {
+        Write-Host "         Could not find the Windows drive that stores $distro. Before model downloads ODS will check only the space inside Ubuntu." -ForegroundColor Yellow
+    }
     Write-ODSPortalStage 4 'INSTALL PIXEL / PORTAL' "Prerequisites passed for $distro. Starting the Linux installer."
     Write-Host '         When Ubuntu asks for your [sudo] password, type your Ubuntu password and press Enter. Nothing appears while you type.'
     $exitCode = Invoke-ODSPortalLinuxInstaller $InstallerRoot $distro $linuxArgs ([string]$Options['InstallDir']) (-not $nonInteractive) (Get-ODSPortalDockerDesktop).Exe ([string]$Options['StateRoot']) $script:ODSPortalNewInstallationArguments $forwardEnvironment

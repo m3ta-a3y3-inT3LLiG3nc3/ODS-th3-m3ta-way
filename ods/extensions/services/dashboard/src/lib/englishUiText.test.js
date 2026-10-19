@@ -24,12 +24,6 @@ const PORTUGUESE = new RegExp(`[ãõçáéíóúâêôàÃÕÇÁÉÍÓÚÂÊÔÀ
 const INPUT_ALIASES = {
   'lib/portalTeams.js': ['(?:agents|agentes)'],
 }
-// Being replaced in a separate change; delete this entry when that lands.
-// It is not checked for staleness so either change can merge first.
-const PENDING = {
-  'pages/Pixel.jsx': ['Publique o site que voce criou'],
-}
-
 function sources(dir, out = []) {
   for (const name of readdirSync(dir)) {
     const path = join(dir, name)
@@ -63,7 +57,6 @@ describe('dashboard UI text', () => {
         if (!PORTUGUESE.test(line)) return
         const alias = (INPUT_ALIASES[name] ?? []).find((fragment) => line.includes(fragment))
         if (alias) { used.add(`${name}:${alias}`); return }
-        if ((PENDING[name] ?? []).some((fragment) => line.includes(fragment))) return
         unexpected.push(`${name}:${index + 1}: ${line.trim().slice(0, 120)}`)
       })
     }

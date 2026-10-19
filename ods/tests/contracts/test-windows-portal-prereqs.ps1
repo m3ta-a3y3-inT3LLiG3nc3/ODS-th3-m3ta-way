@@ -95,6 +95,31 @@ $script:virt = $true; $script:arm64Asked = $false
 }
 Check (-not $script:arm64Asked) 'the architecture is read only when setup stops for virtualization'
 
+# The Windows drive under the distribution's virtual disk comes from its WSL
+# registration (BasePath); anything without a drive letter stays unknown.
+function Get-ODSPortalWslRegistrations { return $script:registrations }
+foreach ($case in @(
+    @{ base='C:\Users\Ana Maria\AppData\Local\Packages\CanonicalGroupLimited.Ubuntu24.04LTS_79rhkp1fndgsc\LocalState'; drive='C:'; name='a Store install reports its profile drive' },
+    @{ base='\\?\d:\WSL\Ubuntu-24.04'; drive='D:'; name='a moved distribution with a \\?\ path reports its own drive' },
+    @{ base='\\server\share\wsl'; drive=''; name='a network path names no drive' },
+    @{ base='\\?\UNC\server\share\wsl'; drive=''; name='a long network path names no drive' },
+    @{ base=''; drive=''; name='a registration without BasePath names no drive' })) {
+    # A subkey that is not a distribution (no DistributionName) is skipped.
+    $script:registrations = @(
+        [pscustomobject]@{ Version=2 },
+        [pscustomobject]@{ DistributionName='docker-desktop'; BasePath='E:\Docker\wsl' },
+        [pscustomobject]@{ DistributionName='Ubuntu-24.04'; BasePath=$case.base })
+    Check ((Get-ODSPortalDistroDrive 'ubuntu-24.04') -ceq $case.drive) $case.name
+}
+$script:registrations = @([pscustomobject]@{ DistributionName='Ubuntu'; BasePath='C:\wsl' })
+Check ((Get-ODSPortalDistroDrive 'Ubuntu-24.04') -ceq '') 'an unregistered distribution names no drive'
+$script:registrations = @()
+Check ((Get-ODSPortalDistroDrive 'Ubuntu-24.04') -ceq '') 'no WSL registrations name no drive'
+$script:registrations = @(
+    [pscustomobject]@{ DistributionName='Ubuntu-24.04'; BasePath='C:\wsl' },
+    [pscustomobject]@{ DistributionName='Ubuntu-24.04'; BasePath='D:\wsl' })
+Check ((Get-ODSPortalDistroDrive 'Ubuntu-24.04') -ceq '') 'an ambiguous registration names no drive'
+
 # Docker inside the distro: a bounded wait that stops at the first answer
 # or at the deadline, never beyond it.
 $script:answers = [Collections.Generic.Queue[int]]::new()

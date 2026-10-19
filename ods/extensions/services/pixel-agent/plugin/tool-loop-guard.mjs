@@ -36,6 +36,7 @@ import { assistantMessageText, composeProgressFinalization, composeReadPages, cr
   PROGRESS_FINALIZATION_INSTRUCTION } from "./progress-finalization.mjs";
 import { STOP_SYNTHESIS_LIMITS, STOP_SYNTHESIS_NOTE, synthesisAnswer, synthesisRequest } from "./stop-synthesis.mjs";
 import { createRunDeadline, runDeadlineReached, runDeadlineStopText, takeRunDeadlineNotice } from "./run-deadline.mjs";
+import { outputLimitContext, outputLimitCut, outputLimitNotice, outputLimitStopText } from "./output-limit.mjs";
 import { OWNER_VISIBLE_REPLY_INSTRUCTION, OWNER_VISIBLE_REPLY_REASON, ownerInteractiveTurn, silentReplyText } from "./owner-visible-reply.mjs";
 import { canonicalWorkspaceParams, extensionlessHtmlWrite, workspaceFileParent, nativeExecWorkdir, sandboxHostWorkspaceFailure, malformedRelativeWorkspacePath } from "./workspace-path-contract.mjs";
 import { routePlaygroundTool, requestsNewPlaygroundProject } from "./playground-projects.mjs";
@@ -169,6 +170,9 @@ export const VISIBLE_REPLY_REQUIRES_FINAL_REASON =
 
 export const OWNER_NO_TOOLS_REASON =
   "The owner explicitly requested no tools for this turn. No tool was run. Answer directly from the information already available; do not call another tool.";
+
+export const ATTACHED_PICTURE_IN_CONTEXT_REASON =
+  "That picture is attached to the owner's current message and is already in your context. No tool can fetch, open or search it, and no tool was run. Look at the picture and answer the owner directly.";
 
 export const EDIT_CREATE_REQUIRES_WRITE_REASON =
   "edit cannot create a new file because every edit replacement requires a non-empty oldText copied from existing content. Use the visible tool_call control now with id write and args containing the same path plus the exact newText as content. Do not retry edit.";
@@ -420,6 +424,33 @@ export const OPERATIONS_REQUIRES_PROJECTIONS_REASON =
 export const OPERATIONS_LOOP_ABORT_REASON =
   "Pixel stopped this response because it requested another non-Operations tool after the host Operations boundary was enforced. Start a fresh message to retry the named broker action.";
 
+// Owner copy for that stop. The harness ends the aborted run with its own
+// error, which read "LLM request timed out." (fleet 2026-10-18, laptop).
+// A tool name is model-written; only a plain identifier is shown.
+function operationsLoopCause({tool, boundary}) {
+  const name = typeof tool === "string" && /^[a-z][a-z0-9_]{0,63}$/.test(tool) ? `\`${tool}\`` : "another tool";
+  return boundary === "continuation"
+    ? `this response was waiting for the result of an ODS Operations job, and the model called ${name} instead of reading it`
+    : `this request needed ODS Operations work on this computer, and the model kept calling ${name}, which that step does not allow`;
+}
+
+// A combined request would meet the same boundary again, so the retry advice
+// asks for other work in a message of its own.
+export function operationsLoopDeliveryText(abort) {
+  return `**Portal stopped this response:** ${operationsLoopCause(abort)}, so Portal ended the response rather than let it loop. ` +
+    "That call did not run. The conversation and any saved files are preserved. Send a new message to try again, " +
+    "and ask for a file or other work in a message of its own. " +
+    "If it keeps happening, [get help on Discord](https://discord.gg/4ntNp9MAwC).";
+}
+
+// The same stop when Portal had already verified a result, which follows.
+export function operationsLoopVerifiedText(abort) {
+  return `**Portal stopped this response after verifying the result below:** ${operationsLoopCause(abort)}, ` +
+    "so Portal ended the response rather than let it loop. That call did not run. " +
+    "If you need more, such as a file, ask for it in a new message. " +
+    "If it keeps happening, [get help on Discord](https://discord.gg/4ntNp9MAwC).";
+}
+
 export const OPERATIONS_UNAVAILABLE_DELIVERY_PREFIX =
   "Portal did not submit the requested host or Operations work through the isolated Operations Broker. No sandbox command was accepted as host evidence.";
 export const OPERATIONS_UNAVAILABLE_ZERO_SUBMISSIONS_CODE =
@@ -477,7 +508,7 @@ const FILE_PATH_TOOLS = new Set(["read", "write", "edit"]);
 const WORKSPACE_CONTINUATION_TOOLS = new Set([
   "read", "write", "edit", "apply_patch", "exec", "process",
   "pixel_ods_evidence_report", "pixel_ods_evidence_readback", WORKSPACE_BUNDLE_TOOL,
-  "pixel_ods_download_promote",
+  "pixel_ods_download_promote", "pixel_ods_workspace_artifact",
 ]);
 const FAILED_TEST_READ_REPAIR_REASON =
   "The verification command failed. Preserve the owner's explicit behavior contract: correct a test only when its expectation contradicts the owner; otherwise repair the implementation, and never weaken an assertion merely to match broken output. A blank label such as `Invalid integer:` is not a helpful empty-input message. When the failure already contains actual and expected evidence, apply one focused edit to the file implicated by the failure (test or implementation), then rerun the same verification command. If the failure is a missing-file error for a file you previously wrote, recreate it before rerunning. If evidence is insufficient, read the relevant file or run a focused diagnostic, then repair and rerun verification. Report an unresolved blocker honestly when the available tools cannot resolve it.";
@@ -3278,10 +3309,54 @@ function persistedToolSearchEnvelope(
   return undefined;
 }
 
-function persistedToolSearchResult(message, expectedToolName, expectedSourceName) {
-  return Boolean(
-    persistedToolSearchEnvelope(message, expectedToolName, expectedSourceName)
+function captureHostResultEvidence(pending, state, event, context, hostEvent, receipt) {
+  if (!pending || !receipt?.outcome || !hostEvent) return;
+  const runId = context?.runId ?? event?.runId;
+  const toolName = context?.toolName ?? event?.toolName;
+  const toolCallId = context?.toolCallId ?? event?.toolCallId;
+  if (pending.runId !== runId || pending.transport !== toolName ||
+      pending.inspectionSessionId !== state.currentSessionId ||
+      pending.inspectionSessionKey !== state.currentSessionKey ||
+      (context?.sessionId !== undefined && context.sessionId !== state.currentSessionId) ||
+      (context?.sessionKey !== undefined && context.sessionKey !== state.currentSessionKey) ||
+      (event?.runId !== undefined && event.runId !== runId) ||
+      (event?.toolCallId !== undefined && event.toolCallId !== toolCallId) ||
+      (event?.toolName !== undefined && event.toolName !== toolName) ||
+      ![SYNCHRONOUS_HOST_OBSERVE_TOOL, SYNCHRONOUS_HOST_COMMAND_TOOL].includes(pending.selectedToolName) ||
+      !isDeepStrictEqual(hostEvent.params, pending.selectedParams)) return;
+  const details = boundedJsonSnapshot(hostEvent.result?.details);
+  if (!details) return;
+  // The aggregate still requires all owner-requested peer ports. A single
+  // call's result describes only its own observed ports, not that completion.
+  const outcome = { ...receipt.outcome, requiredNetworkPeer: undefined };
+  const text = operationsEvidenceText(
+    new Set(outcome.actions.map(({ action }) => action)),
+    new Map([[outcome.jobId, outcome]]),
+    undefined,
+    synchronousHostOdsStatusProjection(hostEvent)
   );
+  if (text) pending.hostResultEvidence = { details, text };
+}
+
+function persistedHostResultEvidence(pending, state, event, context, runId, toolCallId) {
+  const captured = pending?.hostResultEvidence;
+  const message = event?.message;
+  if (!captured || !state || message?.isError === true || pending.runId !== runId ||
+      pending.transport !== message?.toolName ||
+      pending.inspectionSessionId !== state.currentSessionId ||
+      pending.inspectionSessionKey !== state.currentSessionKey ||
+      (context?.runId !== undefined && context.runId !== runId) ||
+      (context?.sessionId !== undefined && context.sessionId !== state.currentSessionId) ||
+      (context?.sessionKey !== undefined && context.sessionKey !== state.currentSessionKey) ||
+      (context?.toolName !== undefined && context.toolName !== pending.transport) ||
+      (event?.runId !== undefined && event.runId !== runId) ||
+      (event?.toolCallId !== undefined && event.toolCallId !== toolCallId) ||
+      (message?.toolCallId !== undefined && message.toolCallId !== toolCallId)) return undefined;
+  const result = pending.transport === 'tool_call'
+    ? persistedToolSearchEnvelope(message, pending.selectedToolName, 'pixel-ods')?.result
+    : message;
+  return result?.isError !== true && isDeepStrictEqual(result?.details, captured.details)
+    ? captured.text : undefined;
 }
 
 function cleanUnittestSummary(result) {
@@ -4671,6 +4746,23 @@ function ownerForbidsTools(text) {
     return true;
   }
   return false;
+}
+
+// Must match CURRENT_IMAGE_NOTE in host/chat_image_transport.mjs, which the
+// trusted ingress appends after an image turn's pixels and delivery guidance.
+const ATTACHED_PICTURE_NOTE = "[Attached pictures: the image parts of this message are the pictures themselves, ";
+
+function attachedPictureIds(text) {
+  const index = text.lastIndexOf(ATTACHED_PICTURE_NOTE);
+  if (index < 0) return [];
+  return [...new Set(text.slice(index).match(/\bimg-[a-f0-9]{32}\b/g) ?? [])].slice(0, 4);
+}
+
+// A picture already in the model's context cannot be fetched by any tool;
+// small vision models still try, even passing its identifier to web search.
+function namesAttachedPicture(params, ids) {
+  const text = JSON.stringify(params ?? null);
+  return ids.some(id => text.includes(id));
 }
 
 function ownerWorkspaceLaneRequested(text, workspaceRequested) {
@@ -6821,7 +6913,29 @@ export function userMessageWorkspaceContinuationPath(messages, prompt = undefine
     }
     paths.add(value);
   }
-  return paths.size === 1 ? [...paths][0] : undefined;
+  if (paths.size === 1) return [...paths][0];
+  if (paths.size > 1) return undefined;
+  return userMessageBareWorkspaceFilename(messages, prompt);
+}
+
+// A single owner-named bare filename (no directory) is an unambiguous path
+// binding only when the owner names/calls exactly one such file, it is not
+// quoted as source/instruction text, and no other path-like token competes.
+// This never grants a directory and never overrides an explicit /workspace
+// path (handled by the caller before this runs).
+function userMessageBareWorkspaceFilename(messages, prompt = undefined) {
+  const text = workspacePreviewInstructionText(currentOwnerIntentText(messages, prompt),
+    {preserveFileTargets: true});
+  // Keep this fallback to a named file at the workspace root. A directory,
+  // URL, traversal or competing filename requires an explicit path instead.
+  if (/[\\/]|\bwww\./i.test(text)) return undefined;
+  const files = new Set([...text.matchAll(/\b([A-Za-z0-9][A-Za-z0-9._-]*\.[A-Za-z][A-Za-z0-9]{0,11})\b/g)]
+    .map(match => match[1]));
+  if (files.size !== 1) return undefined;
+  const [name] = files;
+  if (!WORKSPACE_PATH_COMPONENT.test(name)) return undefined;
+  const named = [...text.matchAll(/\b(?:named|called)\s+([A-Za-z0-9][A-Za-z0-9._-]*\.[A-Za-z][A-Za-z0-9]{0,11})\b/gi)];
+  return named.some(match => match[1] === name) ? name : undefined;
 }
 
 export function userMessageWorkspaceDirectoryPath(messages, prompt = undefined) {
@@ -7235,6 +7349,9 @@ export function createToolLoopGuard({
   // (subagent-delivery.mjs ownerRunOf), for the shipped example's guard.
   exampleOwnerRun = () => undefined,
   exampleGuard,
+  // Whether Pixel's model is the owner's remote API route, whose output limit
+  // the owner sets (Settings → Remote model), for output-limit stop text.
+  remoteModelRoute = () => false,
 } = {}) {
   const effective = normalizedLimits(limits);
   const examples = exampleGuard ?? createExampleGuard({warn, now});
@@ -7258,6 +7375,9 @@ export function createToolLoopGuard({
   // next owner message in that chat must start clean from.
   const sessionKeyRuns = new Map();
   const sessionCancellations = new Map();
+  // A tool call the model's output limit cut off, which the chat's next turn
+  // is told to write in smaller parts (output-limit.mjs).
+  const sessionOutputLimits = new Map();
   // Process-wide: a failed or timed-out stop synthesis pauses further ones.
   let stopSynthesisFailedAt = -Infinity;
   const pendingToolRuns = new Map();
@@ -7473,6 +7593,16 @@ export function createToolLoopGuard({
     state.completionAssurance.followWithdrawnRequest(record.ownerText);
   }
 
+  // The next owner turn in a chat whose last response ended on a cut-off tool
+  // call takes that cut once; every attempt of that run is told about it.
+  function takeOutputLimit(state, runId, context, agentId) {
+    const sessionKey = context?.sessionKey;
+    const record = typeof sessionKey === "string" ? sessionOutputLimits.get(sessionKey) : undefined;
+    if (!record || record.runId === runId || !ownerInteractiveTurn(context, agentId)) return;
+    sessionOutputLimits.delete(sessionKey);
+    state.priorOutputLimit = record.cut;
+  }
+
   // A clarification card leaves a record for its chat once the run sets it
   // (the ask tool's result, or the requested-choice repair at finalize): its
   // exact questions and the owner request they clarify. A follow-up card in
@@ -7642,7 +7772,8 @@ export function createToolLoopGuard({
     pendingToolRuns.set(toolCallId, {
       runId,
       selectedToolName,
-      selectedParams: [PREVIEW_INSPECTION_TOOL, 'exec'].includes(selectedToolName)
+      selectedParams: [PREVIEW_INSPECTION_TOOL, 'exec', SYNCHRONOUS_HOST_OBSERVE_TOOL,
+        SYNCHRONOUS_HOST_COMMAND_TOOL].includes(selectedToolName)
         ? structuredClone(selectedParams) : selectedParams,
       executedParams: selectedToolName === 'exec' ? structuredClone(selectedParams) : undefined,
       inspectionSessionId: runs.get(runId)?.currentSessionId,
@@ -7757,6 +7888,8 @@ export function createToolLoopGuard({
         unrequestedOperationsDeniedRound: 0,
         unrequestedOperationsTerminal: false,
         unrequestedOperationsAborted: false,
+        // The tool whose repeat after an Operations correction aborted the run.
+        operationsLoopAborted: undefined,
         operationsInventoryOnly: false,
         operationsInventoryAttempted: false,
         operationsInventory: undefined,
@@ -7768,7 +7901,6 @@ export function createToolLoopGuard({
         operationsSubmittedJobs: new Map(),
         toolExecutionAttempted: false,
         operationsTerminalJobs: new Map(),
-        operationsHostResultCompactionsRemaining: 0,
         operationsTerminalBlocks: 0,
         operationsTerminalAborted: false,
         operationsRequiresOdsAppsProjection: false,
@@ -8028,6 +8160,10 @@ export function createToolLoopGuard({
       blockReason: "Pixel could not recover the owner's request for this subagent continuation. Start a fresh owner message; child results cannot authorize tools.",
     };
     if (state?.ownerNoTools) return {block:true, blockReason:OWNER_NO_TOOLS_REASON};
+    // After compaction the pixels may have left the context; re-reading is then legitimate.
+    if (state?.attachedPictureIds && !state.compactionSeen && namesAttachedPicture(event?.params, state.attachedPictureIds)) {
+      return {block:true, blockReason:ATTACHED_PICTURE_IN_CONTEXT_REASON};
+    }
     // Every tool stays blocked after the budget stops the response. Until the
     // model has seen the finalization instruction, the refusal carries it; a
     // tool call during the answer turn ends the run at this boundary (the
@@ -8827,13 +8963,6 @@ export function createToolLoopGuard({
         toolName,
         selectedToolTarget
       );
-      if (
-        selectedToolName !== SYNCHRONOUS_HOST_OBSERVE_TOOL &&
-        selectedToolName !== SYNCHRONOUS_HOST_COMMAND_TOOL &&
-        state.operationsHostResultCompactionsRemaining > 0
-      ) {
-        state.operationsHostResultCompactionsRemaining = 0;
-      }
     }
     if (toolName === "process" && state) {
       const params = normalizedParams ?? event?.params;
@@ -9053,6 +9182,10 @@ export function createToolLoopGuard({
           return { block: true, blockReason: OPERATIONS_HOST_COMMAND_REQUIRES_PROPOSAL_REASON };
         }
         const params = { command };
+        // The returned route may replace a generic proposal or its command.
+        // Bind the later receipt to what this hook actually admits.
+        rememberToolRun(context?.toolCallId ?? event?.toolCallId, runId,
+          SYNCHRONOUS_HOST_COMMAND_TOOL, params, undefined, toolName, 'pixel-ods');
         return toolName === "tool_call"
           ? { params: { id: SYNCHRONOUS_HOST_COMMAND_TOOL, args: params } }
           : { params };
@@ -9255,6 +9388,7 @@ export function createToolLoopGuard({
       warn(
         `Pixel stopped a tool retry after the Operations-continuation boundary for run ${runId}; active run aborted=${aborted}`
       );
+      if (aborted) state.operationsLoopAborted ??= {tool: effectiveToolName, boundary: "continuation"};
       return { block: true, blockReason: OPERATIONS_LOOP_ABORT_REASON };
     }
 
@@ -9315,6 +9449,7 @@ export function createToolLoopGuard({
       warn(
         `Pixel stopped a tool retry after the Operations boundary for run ${runId}; active run aborted=${aborted}`
       );
+      if (aborted) state.operationsLoopAborted ??= {tool: effectiveToolName, boundary: "operations"};
       return { block: true, blockReason: OPERATIONS_LOOP_ABORT_REASON };
     }
 
@@ -10056,6 +10191,8 @@ export function createToolLoopGuard({
       state.completionAssurance.begin(currentOwnerIntentText(event?.messages, event?.prompt), event);
       const ownerIntent=currentOwnerIntentText(event?.messages,event?.prompt);
       if (ownerIntent && state.ownerNoTools === undefined) state.ownerNoTools=ownerForbidsTools(ownerIntent);
+      const pictureIds=attachedPictureIds(currentUserText(event?.messages,event?.prompt));
+      if (pictureIds.length && state.attachedPictureIds === undefined) state.attachedPictureIds=pictureIds;
       if (ownerIntent) state.extensionCompletionGate ??= createExtensionCompletionGate(ownerIntent);
       if (ownerIntent) state.githubExtensionRequest = /^\s*(?:\/goal\s+)?\/extensions?\s+(?:(?:install|inspect|research)\s+)?https:\/\/github\.com\//i.test(ownerIntent);
       if (capabilities !== undefined) state.preparationExecutionHost = capabilities.executionHost;
@@ -10075,6 +10212,9 @@ export function createToolLoopGuard({
         state.runDeadline = state.artifactOwnerInteractive && !state.managedTeamWorker
           ? createRunDeadline(capabilities.runTimeoutSeconds, now(), state.runDeadline) : undefined;
         state.runDeadlineReached = false;
+        // Like the deadline, a cut belongs to the attempt that wrote it.
+        state.lastReplyCut = undefined;
+        state.outputLimitStop = undefined;
       }
       if (typeof sessionId === "string" && sessionId) {
         state.currentSessionId = sessionId;
@@ -10091,6 +10231,7 @@ export function createToolLoopGuard({
       if (ownerIntent) state.ownerRequestText ??= ownerIntent;
       if (ownerWords) state.managedOwnerWords ??= ownerWords;
       takeOwnerCancellation(state, runId, context, agentId);
+      takeOutputLimit(state, runId, context, agentId);
       takePendingClarification(state, runId, context, agentId, ownerIntent);
       if (currentUserText(event?.messages, event?.prompt)) {
         state.ownerIntentObserved = true;
@@ -10396,7 +10537,7 @@ export function createToolLoopGuard({
   function observeCompaction(context, phase) {
     const state = compactionRunState(context);
     if (!state) return;
-    if (phase === "start") state.compactionWindow = { calls: new Set(), started: 0 };
+    if (phase === "start") { state.compactionWindow = { calls: new Set(), started: 0 }; state.compactionSeen = true; }
     else if (state.compactionWindow?.calls.size === 0) state.compactionWindow = undefined;
     // The summary can drop a delivered run-deadline notice (keepRecentTokens
     // is 8192 on a 131K model), so the stage now due is sent again, with the
@@ -10444,7 +10585,11 @@ export function createToolLoopGuard({
     if (!state || !context?.sessionId || context.sessionId !== state.currentSessionId) return;
     const compaction = state.compactionWindow;
     if (compaction?.calls.delete(event?.callId) && compaction.calls.size === 0) state.compactionWindow = undefined;
-    if (event?.outcome === 'completed') state.modelRouteFailed = false;
+    if (event?.outcome === 'completed') {
+      state.modelRouteFailed = false;
+      // A later model call completed, so that abort did not end this run.
+      state.operationsLoopAborted = undefined;
+    }
     else if (event?.outcome === 'error' && !state.progressAbortAttempted && !state.webLoopAborted &&
         ['timeout', 'connection_closed', 'connection_reset', 'terminated'].includes(event.failureKind)) state.modelRouteFailed = true;
     if (state.extensionPendingHandoff && !state.workspaceLaneRequested && !state.extensionPendingAbortAcknowledged &&
@@ -10633,6 +10778,7 @@ export function createToolLoopGuard({
     if (runningExecSessionId(phantomExecReceipt)) rememberBackgroundExec(state, agentId);
     state.execCallsInFlight.delete(toolCallId);
     const pendingToolRun = pendingToolRuns.get(toolCallId);
+    if (pendingToolRun) pendingToolRun.hostResultEvidence = undefined;
     if (workspacePreviewInspectionAvailable && pendingToolRun?.selectedToolName === PREVIEW_INSPECTION_TOOL &&
         pendingToolRun.runId === runId && pendingToolRun.transport === toolName &&
         pendingToolRun.inspectionGeneration === state.workspaceInspectionGeneration &&
@@ -11254,7 +11400,8 @@ export function createToolLoopGuard({
             hostCommand.outcome
           );
         }
-        state.operationsHostResultCompactionsRemaining = 2;
+        captureHostResultEvidence(pendingToolRun, state, event, context,
+          wrappedHostCommand ?? event, hostCommand);
       }
       const wrappedHostObservation =
         toolName === "tool_call"
@@ -11281,10 +11428,8 @@ export function createToolLoopGuard({
             hostObservation.outcome
           );
         }
-        // A Tool Search call can persist both the selected plugin result and
-        // its outer wrapper. Compact at most those two messages, and clear the
-        // allowance as soon as any different tool starts.
-        state.operationsHostResultCompactionsRemaining = 2;
+        captureHostResultEvidence(pendingToolRun, state, event, context,
+          wrappedHostObservation ?? event, hostObservation);
         const combinedStatus = synchronousHostOdsStatusProjection(
           wrappedHostObservation ?? event
         );
@@ -11868,6 +12013,30 @@ export function createToolLoopGuard({
           "Reply only after the real readback succeeds.",
       };
     }
+    // Both the exact bound write and read succeeded. If the owner asked for a
+    // download and no verified artifact has been accepted yet, coach the real
+    // publication. The write/read receipt is not semantic completion; only a
+    // byte-verified publication receipt satisfies delivery. Respect the same
+    // artifact scope (owner/session/run, cancellation, budget, attempt limit)
+    // that gates reserveWorkspaceArtifact.
+    if (
+      state.workspaceDocumentDeliveryRequested &&
+      !state.workspaceArtifacts?.length &&
+      workspaceArtifactUnavailableReason({
+        agentId: "pixel",
+        runId,
+        sessionId: state.currentSessionId,
+        sessionKey: state.currentSessionKey,
+      }) === undefined
+    ) {
+      return {
+        stage: "workspace-publish",
+        instruction:
+          `Do not reply yet. Call tool_call now with id pixel_ods_workspace_artifact ` +
+          `and args ${JSON.stringify({ relativePath })}. ` +
+          "Publish only the exact file you just wrote and read back; accept only a byte-verified receipt.",
+      };
+    }
     return undefined;
   }
 
@@ -12418,29 +12587,7 @@ export function createToolLoopGuard({
       !state.progressBudget.laneExhausted('workspace') && !state.operationsRequired && !state.exactDownloadRequested
       ? requestedControlNameInstruction(state.workspacePreview, state.workspaceControlNameCheck,
         state.workspaceControlNameSources) : undefined;
-    const hostToolResult =
-      pending?.selectedToolName === SYNCHRONOUS_HOST_OBSERVE_TOOL ||
-      pending?.selectedToolName === SYNCHRONOUS_HOST_COMMAND_TOOL ||
-      state?.operationsHostResultCompactionsRemaining > 0 ||
-      persistedToolSearchResult(
-        message,
-        SYNCHRONOUS_HOST_OBSERVE_TOOL,
-        "pixel-ods"
-      ) ||
-      persistedToolSearchResult(
-        message,
-        SYNCHRONOUS_HOST_COMMAND_TOOL,
-        "pixel-ods"
-      );
-    const hostEvidence =
-      hostToolResult
-        ? operationsEvidenceText(
-          state?.operationsRequiredActions,
-          state?.operationsTerminalJobs,
-          state?.operationsOdsAppsProjection,
-          state?.operationsOdsStatusProjection
-        )
-        : undefined;
+    const hostEvidence = persistedHostResultEvidence(pending, state, event, context, runId, toolCallId);
     // The external broker keeps the complete terminal receipt. Once the guard
     // has structurally validated that receipt in afterToolCall, persist only a
     // compact, receipt-bound projection into the model conversation. Tool
@@ -12522,9 +12669,6 @@ export function createToolLoopGuard({
     }
     if (controlNameRepair && coachingDue('control-name', `[ODS Pixel next step] ${controlNameRepair}`)) {
       content.push({type: 'text', text: `[ODS Pixel next step] ${controlNameRepair}`});
-    }
-    if (hostEvidence && state.operationsHostResultCompactionsRemaining > 0) {
-      state.operationsHostResultCompactionsRemaining -= 1;
     }
     if (continuation) {
       content.push({
@@ -12844,7 +12988,30 @@ export function createToolLoopGuard({
     state.runEnded = true;
     state.runDeadlineReached = !state.clientCancelled && !state.odsAborted && !state.progressBudget.exhausted &&
       !state.recursiveDeleteDenied && runDeadlineReached(state.runDeadline, event, now());
+    // The harness runs tool calls only after a 'toolUse' stop, so a reply cut
+    // at the output limit ends the response with its last call never run.
+    // Only the owner's own turns: team workers and other lanes report to a
+    // coordinator or parent, not to the owner.
+    state.outputLimitStop = !state.clientCancelled && !state.odsAborted && event?.success !== false &&
+      state.artifactOwnerInteractive && !state.managedTeamWorker ? state.lastReplyCut : undefined;
+    const sessionKey = state.currentSessionKey;
+    if (state.outputLimitStop?.tool && typeof sessionKey === "string") {
+      rememberBySessionKey(sessionOutputLimits, sessionKey, {runId, cut: state.outputLimitStop});
+    } else if (typeof sessionKey === "string" && sessionOutputLimits.get(sessionKey)?.runId === runId) {
+      sessionOutputLimits.delete(sessionKey);
+    }
     settlePendingClarification(state, event);
+  }
+
+  // before_message_write, in transcript order: the last reply this run wrote
+  // decides whether its response ended at the output limit. agent_end's
+  // message list is the whole session history, not this attempt.
+  function observeReplyEnd(event, context, agentId = 'pixel') {
+    const agent = context?.agentId ?? event?.agentId;
+    if (agent !== undefined && agent !== agentId) return;
+    if (event?.message?.role !== 'assistant') return;
+    const active = activeSessionRun(context?.sessionKey ?? event?.sessionKey);
+    if (active) active.state.lastReplyCut = outputLimitCut(event.message);
   }
 
   // Model-only prompt context for one attempt (before_prompt_build
@@ -12854,7 +13021,9 @@ export function createToolLoopGuard({
   function promptContextForRun(runId) {
     const state = typeof runId === "string" ? runs.get(runId) : undefined;
     if (state?.clientCancelled) return CLIENT_CANCELLED_REASON;
-    return state?.withdrawnOwnerRequest && !resendsWithdrawnAnswer(state) ? OWNER_CANCELLED_REQUEST_CONTEXT : undefined;
+    const withdrawn = state?.withdrawnOwnerRequest && !resendsWithdrawnAnswer(state) ? OWNER_CANCELLED_REQUEST_CONTEXT : undefined;
+    const outputLimit = state?.priorOutputLimit ? outputLimitContext(state.priorOutputLimit) : undefined;
+    return [withdrawn, outputLimit].filter(Boolean).join('\n\n') || undefined;
   }
 
   // The owner stopped a clarification answer and sent the same answer again.
@@ -13420,7 +13589,12 @@ export function createToolLoopGuard({
     // The shipped example's one owner line, which Portal's ingress adds after
     // the reply it delivers (host/pixel_ingress.mjs). A pending question card
     // carries none.
-    const notice = result.status === 'pending' ? undefined : exampleNoticeForRun(runId);
+    // A cut-off text answer is delivered as written, with its notice first.
+    // The ingress takes one line of at most 1024 characters.
+    const cut = state?.outputLimitStop?.answered && !state.clientCancelled && !state.progressBudget.exhausted
+      ? outputLimitNotice(state.outputLimitStop, {remote: remoteModelRoute() === true}) : undefined;
+    const notice = result.status === 'pending' ? undefined
+      : [cut, exampleNoticeForRun(runId)].filter(Boolean).join(' ').slice(0, 1024);
     if (notice) result = {...result, notice};
     return artifacts?.length && !state.clientCancelled && ['none','passed','failed'].includes(result.status)
       ? {...result,artifacts:structuredClone(artifacts)} : result;
@@ -13444,6 +13618,21 @@ export function createToolLoopGuard({
         preview && `[Open last published preview](${preview.url})\n\nThis is the last verified publication, not proof that all requested work completed.`,
         failure?.text].filter(Boolean).join('\n\n').slice(0, MAX_INGRESS_VERIFICATION_TEXT),
       ...(failure?.preview ? {preview: failure.preview}
+        : preview ? {preview: {schemaVersion: 1, kind: 'ods-pixel-workspace-preview', ...preview}} : {})};
+    }
+    // Without this the owner saw only a missing preview or "No detailed
+    // failure reason was returned". Verified facts and the last published
+    // preview follow, as after the run deadline. A cut-off text answer keeps
+    // its text and gets a notice instead (deliveryVerificationForRun).
+    const outputLimit = !state?.clientCancelled && !state?.progressBudget.exhausted ? state?.outputLimitStop : undefined;
+    if (outputLimit && !outputLimit.answered) {
+      const prior = (verification.status === 'failed' || verification.status === 'passed') && verification.text
+        ? verification : undefined;
+      const preview = prior?.preview ? undefined : progressStopPreview(state);
+      return {status: 'failed', text: [outputLimitStopText(outputLimit, {remote: remoteModelRoute() === true}),
+        preview && `[Open last published preview](${preview.url})\n\nThis is the last verified publication, not proof that all requested work completed.`,
+        prior?.text].filter(Boolean).join('\n\n').slice(0, MAX_INGRESS_VERIFICATION_TEXT),
+      ...(prior?.preview ? {preview: prior.preview}
         : preview ? {preview: {schemaVersion: 1, kind: 'ods-pixel-workspace-preview', ...preview}} : {})};
     }
     // Completion assurance arms its terminal before a revision and is not
@@ -13497,10 +13686,23 @@ export function createToolLoopGuard({
         (state.operationsRequiredActions.size > 0 &&
           [...state.operationsRequiredActions].every((action) =>
             action.startsWith("host.") || action === "ods.extensions.list" || action === "ods.extensions.search"))));
-    return verification.status === "passed" && verification.text &&
+    const result = verification.status === "passed" && verification.text &&
       (readOnlyOperations || verification.preview || state?.exactDownloadPromotion)
       ? derivedOutcome(verification, { ...verification, deliveryMode: "append" })
       : verification;
+    // After an Operations-boundary abort the harness error ("LLM request
+    // timed out.") is the reply: alone, or above appended evidence. Name the
+    // cause there. A receipt or failure text that replaces it stays as it is.
+    const abort = state?.clientCancelled ? undefined : state?.operationsLoopAborted;
+    if (abort && result.status === "none") {
+      return { status: "failed", text: operationsLoopDeliveryText(abort) };
+    }
+    if (abort && result.deliveryMode === "append") {
+      const verified = { ...result, text: `${operationsLoopVerifiedText(abort)}\n\n${result.text}`.slice(0, MAX_INGRESS_VERIFICATION_TEXT) };
+      delete verified.deliveryMode;
+      return verified;
+    }
+    return result;
   }
 
   function replyPayloadSending(event) {
@@ -13603,6 +13805,7 @@ export function createToolLoopGuard({
     citationVerificationForRun: runId => [...(runs.get(runId)?.hostCitationVerifications ?? [])],
     endPreviewRevalidation,
     observeAgentEnd,
+    observeReplyEnd,
     promptContextForRun,
     clarificationContextForRun,
     replyPayloadSending,

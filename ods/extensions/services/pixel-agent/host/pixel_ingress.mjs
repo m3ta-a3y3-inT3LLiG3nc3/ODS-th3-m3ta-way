@@ -21,8 +21,8 @@ import { parseTaskActivity } from "./task_activity_schema.mjs";
 import { parseQuestions } from "./questions_schema.mjs";
 import {createChatHistoryLedger,HistoryError} from './chat_history_ledger.mjs';
 import {createChatImageStore,createChatImageReadHandler,ChatImageError} from './chat_image_store.mjs';
-import {decodeChatImageTurn,nativeHistoryMessages,validateImageRoute} from './chat_image_transport.mjs';
-import {handleAccessMode, handleModelControl, readAccessOwnerKey} from './access_mode_relay.mjs';
+import {currentImageNote,decodeChatImageTurn,nativeHistoryMessages,validateImageRoute} from './chat_image_transport.mjs';
+import {handleAccessMode, handleModelControl, publicModelControl, readAccessOwnerKey, requestAccessController} from './access_mode_relay.mjs';
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -2159,8 +2159,8 @@ async function handleChat(req, res, token, gatewayPort, deps, historyLedger, his
       imageStore.put(user,images,prepared.state.messages.flatMap(message=>message.images||[]));
     }
     const nativeLatest={role:latest.role,content:latest.content};
-    if(images.length) nativeLatest.content=[...latest.content,{type:'text',text:
-      nativeHistoryMessages([{role:'user',content:'',images:archivedLatest.images}])[0].content}];
+    // The pixels ride in this message; history replay uses the retrieval note.
+    if(images.length) nativeLatest.content=[...latest.content,{type:'text',text:currentImageNote(archivedLatest.images)}];
     // Identity/delivery policy belongs to the trusted API/edge messages. The
     // snapshot is data only; it cannot introduce system/developer instructions.
     outgoing.messages=[...(outgoing.messages || []).filter(message=>message.role==='system'),...nativeHistoryMessages(prepared.delta.slice(0,-1)),nativeLatest];
@@ -2320,19 +2320,43 @@ export async function start(cfg = configFromEnv(), opts = {}) {
     throw error;
   }
 
-  const interval = setInterval(() => {
-    void writeStatus(
+  let closed = false;
+  let statusRefresh = null;
+  const refreshStatus = async () => {
+    // systemd binds one config inode into this service. Atomic model changes
+    // replace the owner's file, leaving that private bind on the old inode.
+    // The existing owner controller reads the current committed route without
+    // giving ingress access to the owner's home or restarting active chats.
+    let configuredRuntime = null;
+    try {
+      const request = deps.requestAccessController ?? requestAccessController;
+      const result = await request({operation: 'model-route-status'}, {timeout: 20000});
+      if (result.status === 200) {
+        const current = publicModelControl(result.body);
+        if (!current.pending) {
+          configuredRuntime = {model: current.contract.model, context_length: current.contract.contextLength};
+        }
+      }
+    } catch {
+      // Missing, busy or invalid current evidence means unknown, never the
+      // bound startup config or an unrelated local model kept for rollback.
+    }
+    await writeStatus(
       true,
       cfg.gatewayPort,
       cfg.statusFile,
       cfg.odsVersion,
       deps,
       cfg.appPorts,
-      gateway.runtimeAuthoritative ? gateway.runtime : undefined
-    ).catch(() => {});
+      configuredRuntime
+    );
+  };
+  const interval = setInterval(() => {
+    // Skip ticks while a probe is pending instead of queuing stale projections.
+    if (closed || statusRefresh) return;
+    statusRefresh = refreshStatus().catch(() => {}).finally(() => { statusRefresh = null; });
   }, cfg.statusIntervalMs);
   interval.unref();
-  let closed = false;
   return {
     server,
     interval,
@@ -2340,6 +2364,7 @@ export async function start(cfg = configFromEnv(), opts = {}) {
       if (closed) return;
       closed = true;
       clearInterval(interval);
+      if (statusRefresh) await statusRefresh;
       await new Promise((resolve) => server.close(resolve));
       try {
         const current = fs.lstatSync(cfg.socketPath);

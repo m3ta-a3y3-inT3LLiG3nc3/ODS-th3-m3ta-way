@@ -249,6 +249,9 @@ _EMPTY_REPLY = (
     "I couldn't produce a useful response to that request. Please try again or "
     "tell me what you'd like me to do differently."
 )
+# A final reply that only repeats the owner's message is compared, and held
+# while streaming, only when both texts are at most this many characters.
+_MAX_ECHO_CHARS = 8192
 _INTERACTIVE_DELIVERY_CONTRACT = (
     "\n\n[ODS Portal delivery requirement: Answer the owner's complete message above. "
     "If it asks for exact text, copy that full exact text. Do not answer with a "
@@ -675,15 +678,53 @@ def _with_interactive_delivery_contract(data: dict) -> dict:
     return data
 
 
-def _reserved_reply(value) -> bool:
-    return isinstance(value, str) and (
-        not value.strip() or value.strip() in _RESERVED_ASSISTANT_REPLIES
+def _echo_form(text: str) -> str | None:
+    """Text as compared with the owner's message, or None when it is too long.
+
+    Line breaks and spacing collapse; letter case is kept. A model that copies
+    the request copies it verbatim, while a reply that differs only in case
+    can be a requested transformation. The length bound keeps this check and
+    the streaming hold small; a copied request is short.
+    """
+    text = text.strip()
+    return " ".join(text.split()) if len(text) <= _MAX_ECHO_CHARS else None
+
+
+def _replaceable_reply(value, owner_echo: str = "") -> bool:
+    """A reserved/empty final reply, or one that only copies the owner's message.
+
+    ``owner_echo`` is the owner's latest message in ``_echo_form``, taken
+    before the delivery contract and routes are appended ("" disables the
+    copy check). A reply that quotes part of the message, such as "X" for
+    "Reply with exactly: X", is a different text and is never replaced.
+    """
+    if not isinstance(value, str):
+        return False
+    normalized = value.strip()
+    return (not normalized or normalized in _RESERVED_ASSISTANT_REPLIES
+            or (bool(owner_echo) and _echo_form(value) == owner_echo))
+
+
+def _reserved_prefix(text: str) -> bool:
+    """Streamed text that can still become an empty or reserved reply."""
+    normalized = text.strip()
+    return not normalized or any(
+        reserved.startswith(normalized) for reserved in _RESERVED_ASSISTANT_REPLIES
     )
 
 
+def _replaceable_prefix(text: str, owner_echo: str = "") -> bool:
+    """Streamed text that can still become a replaceable final reply."""
+    if _reserved_prefix(text):
+        return True
+    form = _echo_form(text) if owner_echo else None
+    return form is not None and owner_echo.startswith(form)
+
+
 def _rewrite_json_response(raw: bytes, fallback: str,
-                           response_model: str = _LEGACY_MODEL) -> bytes:
-    """Rewrite model identity and replace only an exact reserved/empty final reply."""
+                           response_model: str = _LEGACY_MODEL,
+                           owner_echo: str = "") -> bytes:
+    """Rewrite model identity and replace only an exact reserved/empty or copied final reply."""
     try:
         parsed = json.loads(_rewrite_json_model(raw, response_model))
     except (json.JSONDecodeError, ValueError):
@@ -694,7 +735,7 @@ def _rewrite_json_response(raw: bytes, fallback: str,
             if not isinstance(choice, dict):
                 continue
             message = choice.get("message")
-            if isinstance(message, dict) and _reserved_reply(message.get("content")):
+            if isinstance(message, dict) and _replaceable_reply(message.get("content"), owner_echo):
                 message["content"] = fallback
     return json.dumps(parsed).encode("utf-8")
 
@@ -1434,6 +1475,9 @@ async def _handle_admitted_chat(request, image_turn, reservation, limit):
     if req_model not in _ALLOWED_MODELS:
         return web.json_response({"error": "model not allowed"}, status=400)
     empty_reply_fallback = _empty_reply_fallback(data)
+    # The owner's own words, before the delivery contract is appended. A final
+    # reply that only repeats them answers nothing and gets the fallback too.
+    owner_echo = _echo_form(_latest_user_text(data)) or ""
     upstream_data = _with_interactive_delivery_contract(data)
     # Let the selected model's runtime/profile supply omitted sampling values.
     # A universal greedy override can defeat the model's recommended settings
@@ -1487,7 +1531,7 @@ async def _handle_admitted_chat(request, image_turn, reservation, limit):
                 if "text/event-stream" in ctype:
                     return await _stream_upstream(
                         request, resp, empty_reply_fallback, cancel_event, activity,
-                        response_model=req_model
+                        response_model=req_model, owner_echo=owner_echo
                     )
 
                 if "application/json" not in ctype:
@@ -1501,7 +1545,8 @@ async def _handle_admitted_chat(request, image_turn, reservation, limit):
                         return web.json_response({"error": "upstream response too large"},
                                                  status=502)
 
-                rewritten = _rewrite_json_response(bytes(resp_body), empty_reply_fallback, req_model)
+                rewritten = _rewrite_json_response(bytes(resp_body), empty_reply_fallback, req_model,
+                                                   owner_echo)
                 activity["terminal"] = True
                 return web.Response(status=resp.status, body=rewritten,
                                     content_type="application/json")
@@ -1589,8 +1634,14 @@ async def _stream_upstream(
     cancel_event: asyncio.Event | None = None,
     activity: dict | None = None,
     response_model: str = _LEGACY_MODEL,
+    owner_echo: str = "",
 ):
-    """Stream bounded SSE while replacing only a reserved/empty final reply."""
+    """Stream bounded SSE while replacing only a reserved/empty or copied final reply.
+
+    Answer text is withheld only while it can still become such a reply: empty,
+    a prefix of a reserved reply, or a prefix of the owner's own message
+    (``owner_echo``). It is flushed as soon as it diverges.
+    """
     response = web.StreamResponse(
         status=resp.status,
         headers={"Content-Type": "text/event-stream", "Cache-Control": "no-cache"},
@@ -1602,13 +1653,21 @@ async def _stream_upstream(
     pending_text = ""
     passthrough = False
 
-    def queue_pending(line, event, content, finish_reason):
-        nonlocal pending_bytes
+    async def queue_pending(line, event, content, finish_reason):
+        nonlocal pending_bytes, passthrough
         # The line cap alone does not bound many small reasoning/empty frames.
         size = len(line) + 1
         if (pending_bytes + size > _MAX_SSE_PENDING_BYTES
                 or len(pending) >= _MAX_SSE_PENDING_LINES):
-            raise ValueError("SSE prelude exceeded limit")
+            if _reserved_prefix(pending_text):
+                raise ValueError("SSE prelude exceeded limit")
+            # Only a possible copy of the owner's message is withheld. That
+            # check is best effort: release the text unchanged at the existing
+            # bound instead of failing the answer.
+            await flush_pending()
+            await response.write(line + b"\n")
+            passthrough = True
+            return
         pending.append((line, event, content, finish_reason))
         pending_bytes += size
 
@@ -1662,8 +1721,7 @@ async def _stream_upstream(
                     continue
 
                 if line == b"data: [DONE]":
-                    normalized = pending_text.strip()
-                    if not normalized or normalized in _RESERVED_ASSISTANT_REPLIES:
+                    if _replaceable_reply(pending_text, owner_echo):
                         template = next(
                             (item[1] for item in reversed(pending) if isinstance(item[1], dict)),
                             {"model": response_model},
@@ -1686,8 +1744,7 @@ async def _stream_upstream(
                     passthrough = True
                     continue
                 if finish_reason is not None:
-                    normalized = pending_text.strip()
-                    if not normalized or normalized in _RESERVED_ASSISTANT_REPLIES:
+                    if _replaceable_reply(pending_text, owner_echo):
                         template = event if isinstance(event, dict) else next(
                             (item[1] for item in reversed(pending) if isinstance(item[1], dict)),
                             {"model": response_model},
@@ -1699,14 +1756,10 @@ async def _stream_upstream(
                     passthrough = True
                     continue
 
-                queue_pending(line, event, content, finish_reason)
-                if content is not None:
+                await queue_pending(line, event, content, finish_reason)
+                if content is not None and not passthrough:
                     pending_text += content
-                    normalized = pending_text.strip()
-                    if normalized and not any(
-                        reserved.startswith(normalized)
-                        for reserved in _RESERVED_ASSISTANT_REPLIES
-                    ):
+                    if not _replaceable_prefix(pending_text, owner_echo):
                         await flush_pending()
                         passthrough = True
         if cancel_event is not None and cancel_event.is_set():
@@ -1725,12 +1778,11 @@ async def _stream_upstream(
                 await response.write(line)
             else:
                 event, content, finish_reason = _sse_event(line)
-                queue_pending(line, event, content, finish_reason)
-                if content is not None:
+                await queue_pending(line, event, content, finish_reason)
+                if content is not None and not passthrough:
                     pending_text += content
         if not passthrough and pending:
-            normalized = pending_text.strip()
-            if not normalized or normalized in _RESERVED_ASSISTANT_REPLIES:
+            if _replaceable_reply(pending_text, owner_echo):
                 template = next(
                     (item[1] for item in reversed(pending) if isinstance(item[1], dict)),
                     {"model": response_model},

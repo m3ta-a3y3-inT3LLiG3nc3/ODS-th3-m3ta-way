@@ -54,6 +54,7 @@ import PixelTurnNavigation from '../components/PixelTurnNavigation'
 import PixelSnapshotChanges from '../components/PixelSnapshotChanges'
 import PortalDeliveredArtifacts from '../components/PortalDeliveredArtifacts'
 import { deliveredArtifactDisplayText, deliveredArtifactMetadata, parseDeliveredArtifactsFrame } from '../lib/pixelDeliveredArtifacts'
+import { embedDisplayText } from '../lib/embedDisplay'
 import PortalWorkspace from '../components/PortalWorkspace'
 import { parseTaskActivity, parseTaskActivityFrame } from '../lib/pixelTaskActivity'
 import MetalMetricIcon from '../components/MetalMetricIcon'
@@ -95,7 +96,7 @@ const LEGACY_MODEL_SUPPORT = { tier: 'adaptive', detail: MODEL_CAPABILITY_DETAIL
 const keepModelAdvisory = current => current?.reason ? current : LEGACY_MODEL_SUPPORT
 
 const MARKDOWN_COMPONENTS = {
-  p: ({ children }) => <p className="break-words [&:not(:first-child)]:mt-3">{children}</p>,
+  p: ({ children, className = '' }) => <p className={`break-words [&:not(:first-child)]:mt-3 ${className}`.trim()}>{children}</p>,
   ul: ({ children }) => <ul className="my-2 list-disc space-y-1 pl-5">{children}</ul>,
   ol: ({ children }) => <ol className="my-2 list-decimal space-y-1 pl-5">{children}</ol>,
   li: ({ children }) => <li className="break-words">{children}</li>,
@@ -1947,6 +1948,9 @@ export default function Pixel({ systemStatus = null }) {
           const publicationContent=message.role==='assistant' ? publicationDisplayText(message.content,message.publication) : message.content
           const displayedContent=message.role==='assistant' && message.status==='done'
             ? deliveredArtifactDisplayText(publicationContent,message.artifacts) : publicationContent
+          // Notes replace embeds Portal can't display; Copy keeps the reply's own text.
+          const shownContent=message.role==='assistant'
+            ? embedDisplayText(displayedContent,{streaming:message.status==='streaming'}) : displayedContent
           return (
           <div key={index} data-pixel-message-index={index} tabIndex={-1} data-pixel-response={message.role === 'assistant' ? '' : undefined} className={`mx-auto flex min-w-0 w-full max-w-5xl ${message.role === 'user' ? 'justify-end gap-2' : 'justify-start'}`}>
             {message.role === 'assistant' && <PixelMascot state={pixelReplyPose(message, sending && index === messages.length - 1)} settled={message.status !== 'streaming'} className="pixel-reply-character" />}
@@ -1998,7 +2002,7 @@ export default function Pixel({ systemStatus = null }) {
               {message.role === 'assistant' && message.content ? (
                 <>
                   {message.publication && <PixelSnapshotChanges preview={message.publication} before={message.beforePublication} variant="summary" onPreview={()=>openPublication(message.publication,'preview')} onReview={path=>openPublication(message.publication,'review',path)}/>}
-                  {!message.questions && (displayedContent || message.status==='streaming') && (message.status==='error' ? <PortalResponseError content={displayedContent}/> : <PortalStreamingText key={message.revealResponse || chatIdRef.current} active={message.status==='streaming'} animate={Boolean(message.revealResponse) || message.status==='streaming'} instant={['stopped','recovering'].includes(message.status)} onReveal={chatScroll.onContentResize} components={MARKDOWN_COMPONENTS}>{displayedContent}</PortalStreamingText>)}
+                  {!message.questions && (shownContent || message.status==='streaming') && (message.status==='error' ? <PortalResponseError content={shownContent}/> : <PortalStreamingText key={message.revealResponse || chatIdRef.current} active={message.status==='streaming'} animate={Boolean(message.revealResponse) || message.status==='streaming'} instant={['stopped','recovering'].includes(message.status)} onReveal={chatScroll.onContentResize} components={MARKDOWN_COMPONENTS} artifacts={message.role==='assistant' && message.status==='done' ? message.artifacts : null}>{shownContent}</PortalStreamingText>)}
                   <OperationsApprovalCard content={message.content} />
                   {!message.questions && message.status!=='streaming' && <PortalResponseActions content={displayedContent}/>}
                 </>

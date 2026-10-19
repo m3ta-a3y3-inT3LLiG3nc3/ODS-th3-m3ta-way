@@ -524,6 +524,17 @@ class WindowsLocationTests(unittest.TestCase):
                     bridge._windows_tools({'ODS_WINDOWS_SYSTEM_DIRECTORY': raw})
                 translate.assert_not_called()
 
+    def test_drive_mount_translates_only_a_drive_letter(self):
+        # wslpath answers with the drive's mount under a custom DrvFS root too.
+        with patch.object(bridge, '_path', return_value='/drives/d/') as translate:
+            self.assertEqual(bridge.drive_mount('D:'), Path('/drives/d'))
+        translate.assert_called_once_with('D:\\', '-u')
+        for raw in ('D', 'D:\\', 'D:\n', 'DE:', '1:', r'\\peer\share', None):
+            with self.subTest(raw=raw), patch.object(bridge, '_path') as translate:
+                with self.assertRaises(ValueError):
+                    bridge.drive_mount(raw)
+                translate.assert_not_called()
+
     def test_missing_legacy_windows_path_has_actionable_error_without_guessing_drive(self):
         with patch.object(bridge.shutil, 'which', return_value=None), patch.object(bridge, '_run') as run:
             with self.assertRaisesRegex(bridge.BridgeError, 'rerun the Windows installer'):

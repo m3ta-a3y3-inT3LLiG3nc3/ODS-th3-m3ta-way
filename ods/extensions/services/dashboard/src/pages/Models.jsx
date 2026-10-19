@@ -234,6 +234,8 @@ export default function Models({ compact = false }) {
   }
 
   const activationBusy = Boolean(activationLoading || runtimeActionLoading || modelLifecycle?.active || modelRecoveryPending)
+  const providerBusy = Boolean(modelLifecycle?.active && ['remote_provider_apply', 'remote_provider_proof'].includes(modelLifecycle.operation))
+  const visibleActivationModeError = providerBusy ? 'Wait for the model connection change to finish.' : activationModeError
   const handleConfirmActivation = async (contextLength) => {
     if (!activationConfigModel?.id || activationBusy) return
     const modelId = activationConfigModel.id
@@ -262,7 +264,7 @@ export default function Models({ compact = false }) {
   })
   const retryModelId = catalogModelIdForProgress(models, visibleDownloadProgress?.model)
   const renderModel = model => <ModelTableRow key={model.id} compact={compact} model={model} gpu={gpu}
-    canActivateModels={canActivateModels} activationModeError={activationModeError} apiMode={llmBackend === 'external'}
+    canActivateModels={canActivateModels} activationModeError={visibleActivationModeError} apiMode={llmBackend === 'external'}
     hermesMinimumContext={hermesMinimumContext} pixelMinimumContext={pixelMinimumContext}
     isCurrentModel={model.id === currentModel} isLoading={pendingModelActions.includes(model.id)}
     loadBusy={pendingModelActions.length > 0} activationBusy={activationBusy}
@@ -322,6 +324,7 @@ export default function Models({ compact = false }) {
       </header>}
 
       <ModelActivationNotice value={modelActivation} pending={modelLifecycle?.operation === 'model_activation'} onRefresh={refresh}/>
+      {providerBusy && <p role="status">ODS is checking or changing the model connection. Wait for it to finish before switching models or requesting recovery.</p>}
       <PortalModelRecovery active={Boolean(modelRecoveryPending || modelActivation?.outcome === 'rollback_unconfirmed') && !modelLifecycle?.active} operationActive={Boolean(modelLifecycle?.active)} refreshKey={modelActivation} onRecovered={refresh}/>
 
       {error && (
@@ -330,7 +333,7 @@ export default function Models({ compact = false }) {
         </div>
       )}
 
-      {!canActivateModels && !(modelManagement?.managed === true && modelManagement.running === false) && (
+      {!providerBusy && !canActivateModels && !(modelManagement?.managed === true && modelManagement.running === false) && (
         <section className={compact ? 'models-external-notice' : 'mb-5 flex flex-col gap-3 rounded-xl border border-theme-border bg-theme-text-secondary/10 p-4 sm:flex-row sm:items-center sm:justify-between'}>
           <div className="flex min-w-0 items-start gap-3">
             <AlertCircle size={18} className="mt-0.5 shrink-0 text-theme-text-secondary" />
@@ -505,7 +508,7 @@ export default function Models({ compact = false }) {
           hermesMinimumContext={hermesMinimumContext}
           isCurrentModel={activationConfigModel.id === currentModel}
           canActivate={canActivateModels && !activationBusy}
-          activationModeError={activationModeError}
+          activationModeError={visibleActivationModeError}
           onCancel={() => setActivationConfigModel(null)}
           onConfirm={handleConfirmActivation}
         />

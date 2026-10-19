@@ -475,3 +475,18 @@ def test_delete_keeps_the_projector_the_windows_plan_loads(managed, monkeypatch)
     assert handler.response_code == 409, handler.parse_response()
     assert (managed["models"] / "new-model.gguf").exists()
     assert (managed["models"] / "mmproj-old.gguf").exists()
+
+
+@pytest.mark.parametrize("control", ["enable_thinking", "always", "none", None])
+def test_measured_thinking_control_reaches_the_held_model_transaction(managed, monkeypatch, control):
+    monkeypatch.setattr(host, "_profile_traits", lambda *_args: {"control": control, "tools": True, "vision": False} if control else None)
+    handler = fixtures._ResponseHandler()
+    host.AgentHandler._do_model_activate(handler, "target-model", requested_context_length=65536)
+    assert handler.response_code == 200, handler.parse_response()
+    contract = managed["pixel"]["contract"]
+    if control is None:
+        assert "thinkingControl" not in contract
+    else:
+        assert contract["thinkingControl"] == control
+    assert managed["pixel"]["pending"] is False
+    assert host._read_pixel_model_journal()["phase"] == "completed"

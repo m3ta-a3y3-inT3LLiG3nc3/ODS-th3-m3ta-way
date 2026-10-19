@@ -77,6 +77,11 @@ const MELEE_DMG_SCALE = 2;   // melee contact hits only
 // the regular spawn and the hound BOSS, because "3x health" plainly means the creature, and a
 // boss hound is still a hound. Keyed on kind rather than inlined into hp so this stays one dial.
 const WOLF_HP_SCALE = 3;
+// -15% wolf movement speed. The hounds felt OP purely from pace, so this is a wolf-only dial
+// multiplied in after ENEMY_SPEED_SCALE at both spawn sites in engine.js. Every other kind reads
+// ENEMY_SPEED_SCALE alone and is untouched. Keyed on kind "fenris" (the only wolf kind), so it
+// covers pack hounds and the hound boss Skarnax alike, same convention as WOLF_HP_SCALE.
+const WOLF_SPD_SCALE = .85;
 // +50% XP required to reach each level. Multiplies the XP gate itself, not the curve's growth
 // rate, so every threshold (including the initial one) is uniformly 1.5x further away.
 const XP_REQUIREMENT_SCALE = 1.5;

@@ -77,6 +77,27 @@ function Get-ODSPortalFreeSystemGB {
     return [math]::Floor(([IO.DriveInfo]::new($root)).AvailableFreeSpace / 1GB)
 }
 
+function Get-ODSPortalWslRegistrations {
+    # One subkey per WSL distribution: its name, and in BasePath the folder
+    # that holds its virtual disk (ext4.vhdx). A missing or unreadable key is
+    # no registration, never a setup stop: setup then says it could not find
+    # the drive, and the host agent reports that drive as not checked.
+    $lxss = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Lxss'
+    return @(Get-ChildItem -LiteralPath $lxss -ErrorAction SilentlyContinue |
+        ForEach-Object { Get-ItemProperty -LiteralPath $_.PSPath -ErrorAction SilentlyContinue })
+}
+
+function Get-ODSPortalDistroDrive([string]$Distro) {
+    # Inside Ubuntu the virtual disk reports its growth limit (about 1 TB) as
+    # free space; the Windows drive that stores it is what downloads fill.
+    # Returns that drive (C:), or '' when WSL records no drive-letter path.
+    $entries = @(Get-ODSPortalWslRegistrations | Where-Object { [string]$_.DistributionName -ieq $Distro })
+    if ($entries.Count -ne 1) { return '' }
+    # Newer registrations prefix the path with \\?\.
+    if ([string]$entries[0].BasePath -match '^(?:\\\\\?\\)?([A-Za-z]):\\') { return $Matches[1].ToUpperInvariant() + ':' }
+    return ''
+}
+
 function Assert-ODSPortalHostCapacity([bool]$WslReady) {
     $free = Get-ODSPortalFreeSystemGB
     if ($free -lt $script:ODSPortalMinimumFreeGB) {
