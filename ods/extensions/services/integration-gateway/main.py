@@ -221,7 +221,7 @@ async def readiness():
     client, workspace_slug = _plane_client_or_503()
     try:
         plane = await client.health(workspace_slug)
-    except PlaneUnavailable as exc:
+    except PlaneUnavailable:
         return {
             "status": "not_ready",
             "platform": "plane",
